@@ -21,6 +21,9 @@ phone, in a browser VS Code that stairway starts on demand, or from a Telegram g
                                   └─ Telegram bot ───▶ group chat about the experiment
 ```
 
+More about why it exists: [ingmmo.com/stairway](https://ingmmo.com/stairway/) · the build story on
+[DEV](https://dev.to/sirmmo/stairway-from-a-chat-idea-to-a-running-claude-code-experiment-on-my-own-server-2eoh).
+
 ## Features
 
 - **MCP server for claude.ai.** It uses Streamable HTTP and has a built-in OAuth 2.1 server (discovery, dynamic
