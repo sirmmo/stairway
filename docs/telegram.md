@@ -40,10 +40,10 @@ file edits happen on their own, and shell commands ask for approval.
 ## Notes
 
 - Only session-mode experiments can be bound, because server mode has no single session to type into.
-- With opencode and crush, messages reach the agent, but their replies aren't relayed (they have no
-  equivalent of Claude Code's `Stop` hook). Use `/screen` to read them.
-- Sessions started before Telegram was configured have no relay hooks. Restart them to get replies in
-  Telegram.
+- Replies are read from the agent's own conversation store, so they're relayed for Claude Code, opencode and
+  crush alike, including sessions that were already running before you bound the chat.
+- Permission-request notices need a Claude Code session started by stairway 0.2 or later (it has the
+  `Notification` hook).
 - When a group becomes a supergroup, its chat id changes. stairway moves the binding automatically.
 - Telegram limits bots to sending files of at most 50 MB, and stairway posts long replies in 4,000-character
   pieces.

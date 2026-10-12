@@ -55,14 +55,16 @@ Each experiment is a folder plus a detached `screen` named `stairway.<name>` tha
 | `opencode` | `opencode <folder> --model <provider>/<model> [--prompt …]`, via the OpenAI-compatible provider | yes |
 | `crush` | `crush --cwd <folder>`, with a generated config for the provider; stairway types the first prompt in | yes |
 
-Non-Claude agents always run in session mode. They have no claude.ai/code link, and their replies aren't
-relayed to Telegram (use `/screen`). Their configs live in `state/agents/<name>/`, so your global opencode and
+Non-Claude agents always run in session mode and have no claude.ai/code link. Their replies are relayed to
+Telegram like Claude's. Their configs live in `state/agents/<name>/`, so your global opencode and
 crush settings are untouched. The experiment's `permission_mode` maps to each agent's own permission settings;
 for example, `bypassPermissions` becomes crush's `--yolo`.
 
 stairway answers Claude Code's one-time "trust this folder?" question itself. It only does so for folders it
-created, or that you approved. In session mode, Claude Code hooks report each finished reply and each
-permission request back to stairway, which relays them to bound Telegram chats.
+created, or that you approved. For experiments bound to a Telegram chat, stairway relays each finished answer.
+It reads them from the agent's own conversation store (Claude Code transcripts, or opencode's and crush's
+databases), so this works for any session, even one already running when you bound it. A Claude Code
+`Notification` hook reports permission requests.
 
 More detail: [docs/architecture.md](docs/architecture.md).
 

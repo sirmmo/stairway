@@ -54,7 +54,7 @@ The session is started as:
 
 ```
 claude --remote-control <name> --permission-mode <mode> \
-       --settings '{"theme": "dark-ansi", "hooks": {"Stop": [...], "Notification": [...]}}' \
+       --settings '{"theme": "dark-ansi", "hooks": {"Notification": [...]}}' \
        --append-system-prompt '<how to send files to the bound Telegram chat>' \
        '<first prompt>'
 ```
@@ -62,13 +62,26 @@ claude --remote-control <name> --permission-mode <mode> \
 - **Prompts** are typed in as one bracketed paste: stairway runs `screen readbuf` and `paste` with
   `ESC[200~ … ESC[201~` around the text, then presses Enter. Multi-line text and special characters arrive
   intact, and Claude Code queues the prompt if it's busy.
-- **The `Stop` hook** POSTs the hook payload, which includes `last_assistant_message`, to
-  `/hooks/<name>/stop`. stairway relays the message to bound Telegram chats.
-- **The `Notification` hook** relays permission requests. Idle notifications are dropped.
+- **The `Notification` hook** POSTs to `/hooks/<name>/notify`, and stairway relays permission requests. Idle notifications are dropped.
 - **Files:** the system prompt tells Claude to `curl` `/hooks/<name>/file` with a path inside the experiment.
   stairway sends that file to the bound chats.
 - **The ANSI theme** is there because `screen` 4.x misreads 24-bit color escape codes as other attributes,
   which shows up as red bars.
+
+## Reply relay
+
+A background thread polls every 3 seconds. For each running session-mode experiment bound to an approved
+Telegram chat, it reads newly finished answers from the agent's own conversation store:
+
+| agent | store | a finished answer is |
+|---|---|---|
+| claude | the newest `~/.claude/projects/<folder, with non-alphanumerics as ->/*.jsonl` | `assistant` entries with `stop_reason: end_turn`, posted once the file has been quiet for one poll |
+| opencode | `~/.local/share/opencode/opencode.db` (sessions matched on `directory`) | an assistant message with `time.completed` that isn't a tool-call step; errors are posted as warnings |
+| crush | `<folder>/.crush/crush.db` | an assistant message with `finished_at` whose finish reason isn't `tool_use`; errors are posted as warnings |
+
+On first sight of an experiment the watcher starts at the end, so history isn't replayed. A new Claude
+transcript, meaning a restarted session, is read from its start. Because nothing depends on hooks, this works
+for sessions started before the chat was bound.
 
 ## Other agents (opencode, crush)
 

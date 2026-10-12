@@ -43,6 +43,7 @@ import secrets
 import select
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -77,7 +78,7 @@ CODE_SERVER = (os.environ.get("STAIRWAY_CODE_SERVER")
                or (sorted(glob.glob(os.path.expanduser("~/.local/lib/code-server-*/bin/code-server"))) or [None])[-1]
                or shutil.which("code-server"))
 
-SERVER_INFO = {"name": "stairway", "version": "0.2.0"}
+SERVER_INFO = {"name": "stairway", "version": "0.3.0"}
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 PERMISSION_MODES = ["default", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"]
@@ -836,6 +837,21 @@ code{font:12.5px ui-monospace,monospace}
 textarea{font:13px/1.4 ui-monospace,monospace;padding:7px 10px;border-radius:7px;border:1px solid var(--line);
 background:var(--card);color:var(--fg);width:100%;resize:vertical}
 .promptform{display:flex;gap:6px;align-items:flex-end;margin-top:8px}.prompt{margin-top:8px;font-size:12px}
+.topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.brand{display:flex;align-items:baseline;gap:10px}nav{display:flex;gap:14px;flex-wrap:wrap;font-size:14px}
+nav a{text-decoration:none}.sysbar{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:12px;color:var(--muted);
+margin:8px 0 4px;font-variant-numeric:tabular-nums}.sysbar span+span:before{content:"·";margin-right:16px}
+.sysbar b{font-weight:500;color:var(--fg)}.meta{font-size:12px;color:var(--muted);margin:-4px 0 8px}
+.sectionhead{display:flex;justify-content:space-between;align-items:baseline}h2 .muted{text-transform:none;letter-spacing:0}
+.chip{font-size:12px;border-radius:99px;padding:1px 9px;background:var(--btn);color:var(--muted)}
+.chip.agent{color:var(--accent)}.chip.ok{color:var(--ok)}.chip.tg{color:var(--fg)}
+.exp .top strong{font-size:16px}.dot{width:9px;height:9px;border-radius:50%;background:var(--off);flex:none}
+.exp.is-running .dot{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 25%,transparent)}
+.card.attention{border-left:3px solid var(--warn)}.card p.muted{margin:4px 0 8px;font-size:13px}
+details.more{display:inline-block;margin:0}details.more summary{list-style:none;font-size:13px;padding:5px 8px}
+details.more[open]{display:block;margin-top:6px}.newpanel summary{font-weight:600;color:var(--accent)}
+.newpanel[open] summary{margin-bottom:10px}.newpanel .newform{border:1px solid var(--line)}
+.promptform textarea{min-height:34px}.foot{margin-top:28px;font-size:12px}
 .login{max-width:360px;margin:12vh auto}.login form{display:grid;gap:10px;margin-top:16px}
 </style></head><body><main>@BODY@</main></body></html>"""
 
@@ -924,10 +940,10 @@ def _new_section():
         _select("mode", RUN_MODES, "session"), _select("permission_mode", PERMISSION_MODES, "default"),
         _select("spawn", SPAWN_MODES, "same-dir"))
     return (
-        '<h2>Add an experiment</h2><div class="newgrid">'
+        '<div class="newgrid">'
         '<form method="post" action="/status" class="card newform"><input type="hidden" name="action" value="create">'
         '<strong>New experiment</strong><p class="muted">Creates <code>%s/&lt;name&gt;</code> and starts '
-        'remote-control in it.</p><label>Name<input name="name" required pattern="[a-z0-9][a-z0-9_-]{0,62}" '
+        'the chosen agent in it.</p><label>Name<input name="name" required pattern="[a-z0-9][a-z0-9_-]{0,62}" '
         'placeholder="my-experiment" title="lowercase letters, digits, - and _"></label>%s'
         '<label class="check"><input type="checkbox" name="git_init" checked> git init</label>'
         '<button class="primary">Create and start</button></form>'
@@ -945,71 +961,94 @@ var t=document.getElementById(b.dataset.copy);navigator.clipboard.writeText(t.va
 b.textContent='Copied';setTimeout(function(){b.textContent='Copy'},1500)})}})</script>"""
 
 
+def _chip(text, cls=""):
+    return '<span class="chip %s">%s</span>' % (cls, html.escape(text))
+
+
+def _experiment_card(n, x, rc, code, chats):
+    e = html.escape
+    state = "running" if n in rc else "stopped"
+    mode = x.get("mode", "server")
+    chips = [_chip(_agent_label(x), "agent")]
+    if n in code:
+        chips.append(_chip("VS Code open", "ok"))
+    chips += [_chip("✈ " + t, "tg") for t in chats]
+    main = []
+    if x.get("url"):
+        main.append('<a class="btn primary" href="%s" target="_blank" rel="noopener">Open in claude.ai</a>' % e(x["url"]))
+    main.append('<a class="btn" href="/code/%s/" target="_blank">VS Code</a>' % e(n))
+    main.append(_button("stop", n, "Stop") if state == "running" else _button("start", n, "Start", "primary"))
+    more = ([_button("editor-stop", n, "Close VS Code")] if n in code else []) + [
+        _button("forget", n, "Forget", "danger", "Stop %s and remove it from stairway? The folder is kept." % n)]
+    body = []
+    if state == "running" and mode == "session":
+        body.append('<form method="post" action="/status" class="promptform"><input type="hidden" name="action" '
+                    'value="prompt"><input type="hidden" name="name" value="%s"><textarea name="prompt" rows="1" '
+                    'required placeholder="Send a prompt…"></textarea><button class="primary">Send</button></form>'
+                    % e(n))
+    if state == "running":
+        body.append("<details><summary>Terminal</summary><pre>%s</pre></details>" % e(_screen_text(rc[n])))
+    history = _prompts(n)
+    if history:
+        body.append("<details><summary>Prompts (%d)</summary>%s</details>" % (len(history), "".join(
+            '<div class="prompt"><span class="muted">%s &middot; %s</span><pre>%s</pre></div>'
+            % (time.strftime("%d %b %H:%M", time.localtime(p["at"])), e(p["source"]), e(p["text"]))
+            for p in reversed(history))))
+    return ('<div class="card exp is-%s"><div class="top"><span class="dot"></span><strong>%s</strong>%s</div>'
+            '<div class="path">%s</div><div class="meta">%s mode &middot; %s permissions &middot; %s</div>'
+            '<div class="actions">%s<details class="more"><summary>more</summary><div class="actions">%s</div>'
+            '</details></div>%s</div>'
+            % (state, e(n), "".join(chips), e(x["path"]), e(mode), e(x.get("permission_mode", "default")),
+               e(x["origin"]), "".join(main), "".join(more), "".join(body)))
+
+
 def status_page(flash="", base=""):
     reg, rc, code = _load(), _screens(RC_PREFIX), _screens(CODE_PREFIX)
     e = html.escape
-    out = ['<header><h1>stairway</h1><span class="muted">%s &middot; experiments root <code>%s</code> &middot; '
-           '<a href="/status">refresh</a> &middot; <a href="/logout">log out</a></span></header>'
-           % (e(socket.gethostname()), e(ROOT))]
+    short = {"load (1/5/15 min)": "load", "memory used": "memory", "disk free (experiments root)": "disk free",
+             "stairway uptime": "up"}
+    stats = "".join('<span title="%s"><b>%s</b> %s</span>' % (e(k), e(short.get(k, k)), e(v)) for k, v in _system_stats())
+    out = ['<header class="topbar"><div class="brand"><h1>stairway</h1><span class="muted">%s</span></div>'
+           '<nav><a href="#experiments">Experiments</a><a href="#telegram">Telegram</a><a href="#connect">Connect</a>'
+           '<a href="/status">Refresh</a><a href="/logout">Log out</a></nav></header>'
+           '<div class="sysbar" title="load (1/5/15 min) · memory · free disk in the experiments root · uptime">%s'
+           '</div>' % (e(socket.gethostname()), stats)]
     if flash:
         out.append('<div class="flash">%s</div>' % e(flash))
-    out.append('<h2>System</h2><div class="stats">')
-    out += ['<div class="stat"><b>%s</b><span>%s</span></div>' % (e(v), e(k)) for k, v in _system_stats()]
-    out.append('<div class="stat"><b>%d / %d</b><span>remote-control / VS Code running</span></div></div>'
-               % (len(rc), len(code)))
-    out.append(_connect_section(base or PUBLIC_URL))
 
-    pending = sorted((n, x) for n, x in reg.items() if not x.get("approved"))
-    if pending:
-        out.append("<h2>Waiting for approval</h2>")
-        for n, x in pending:
-            out.append(
-                '<div class="card"><div class="top"><strong>%s</strong><span class="badge pending">attach request</span>'
-                '</div><div class="path">%s</div><p class="muted" style="margin:0 0 8px">Claude asked to run remote-control '
-                'here (permission mode %s, spawn %s). Approving also trusts this folder: its project settings, hooks and '
-                'MCP servers will apply.</p><div class="actions">%s%s</div></div>'
-                % (e(n), e(x["path"]), e(x.get("permission_mode", "default")), e(x.get("spawn", "same-dir")),
-                   _button("approve", n, "Approve and start", "primary"), _button("reject", n, "Reject", "danger")))
+    attention = []
+    for n, x in sorted((n, x) for n, x in reg.items() if not x.get("approved")):
+        attention.append(
+            '<div class="card attention"><div class="top"><strong>%s</strong><span class="badge pending">folder</span>'
+            '%s</div><div class="path">%s</div><p class="muted">Claude asked to run %s here (%s, %s mode). Approving '
+            'trusts this folder: its project settings, hooks and MCP servers will apply.</p><div class="actions">%s%s'
+            '</div></div>'
+            % (e(n), _chip(_agent_label(x), "agent"), e(x["path"]), e(x.get("agent", "claude")),
+               e(x.get("permission_mode", "default")), e(x.get("mode", "session")),
+               _button("approve", n, "Approve and start", "primary"), _button("reject", n, "Reject", "danger")))
+    attention += _tg_pending_cards()
+    if attention:
+        out.append('<h2>Needs your approval</h2>' + "".join(attention))
 
-    out.append(_new_section())
-    out.append(_tg_section())
-    out.append("<h2>Experiments</h2>")
-    active = sorted((n, x) for n, x in reg.items() if x.get("approved"))
+    active = [(n, x) for n, x in reg.items() if x.get("approved")]
+    active.sort(key=lambda nx: (nx[0] not in rc, nx[0]))
+    chats = {}
+    for c in _tg_load()["chats"].values():
+        if c.get("approved") and c.get("experiment"):
+            chats.setdefault(c["experiment"], []).append(c.get("title") or "chat")
+    out.append('<div class="sectionhead" id="experiments"><h2>Experiments <span class="muted">%d running &middot; '
+               '%d total</span></h2></div>' % (sum(1 for n, _ in active if n in rc), len(active)))
+    out.append('<details class="card newpanel"%s><summary>+ New experiment or attach a folder</summary>%s</details>'
+               % ("" if active else " open", _new_section()))
     if not active:
-        out.append('<p class="muted">None yet. Add one above, or ask Claude to create or attach one.</p>')
-    for n, x in active:
-        state = "running" if n in rc else "stopped"
-        acts = [_button("stop", n, "Stop") if state == "running" else _button("start", n, "Start", "primary")]
-        if x.get("url"):
-            acts.append('<a class="btn" href="%s" target="_blank" rel="noopener">claude.ai/code</a>' % e(x["url"]))
-        acts.append('<a class="btn" href="/code/%s/" target="_blank">VS Code</a>' % e(n))
-        if n in code:
-            acts.append(_button("editor-stop", n, "Close VS Code"))
-        acts.append(_button("forget", n, "Forget", "danger",
-                            "Stop %s and remove it from stairway? The folder is kept." % n))
-        mode = x.get("mode", "server")
-        extra = ""
-        if state == "running":
-            extra = "<details><summary>terminal</summary><pre>%s</pre></details>" % e(_screen_text(rc[n]))
-            if mode == "session":
-                extra += ('<form method="post" action="/status" class="promptform"><input type="hidden" '
-                          'name="action" value="prompt"><input type="hidden" name="name" value="%s">'
-                          '<textarea name="prompt" rows="2" required placeholder="Send a prompt to this session">'
-                          '</textarea><button class="primary">Send</button></form>' % e(n))
-        history = _prompts(n)
-        if history:
-            extra += "<details><summary>prompts sent (%d most recent)</summary>%s</details>" % (len(history), "".join(
-                '<div class="prompt"><span class="muted">%s &middot; %s</span><pre>%s</pre></div>'
-                % (time.strftime("%Y-%m-%d %H:%M", time.localtime(p["at"])), e(p["source"]), e(p["text"]))
-                for p in reversed(history)))
-        out.append(
-            '<div class="card"><div class="top"><strong>%s</strong><span class="badge %s">%s</span>%s'
-            '<span class="muted" style="font-size:12px">%s &middot; %s mode &middot; %s &middot; %s</span></div>'
-            '<div class="path">%s</div><div class="actions">%s</div>%s</div>'
-            % (e(n), state, state, ' <span class="badge running">VS Code open</span>' if n in code else "",
-               e(_agent_label(x)), e(mode), e(x["origin"]), e(x.get("permission_mode", "default")),
-               e(x["path"]), "".join(acts), extra))
-    return _page("stairway status", "".join(out) + COPY_JS)
+        out.append('<p class="muted">None yet. Create one above, or ask Claude (MCP) or the Telegram bot.</p>')
+    out += [_experiment_card(n, x, rc, code, chats.get(n, [])) for n, x in active]
+    out.append(_tg_section())
+    out.append('<div id="connect">%s</div>' % _connect_section(base or PUBLIC_URL))
+    out.append('<p class="muted foot">stairway %s &middot; experiments root <code>%s</code> &middot; '
+               '<a href="https://github.com/sirmmo/stairway">github.com/sirmmo/stairway</a></p>'
+               % (SERVER_INFO["version"], e(ROOT)))
+    return _page("stairway", "".join(out) + COPY_JS)
 
 
 def login_page(next_path, error=""):
@@ -1103,7 +1142,7 @@ def _session_settings(name):
     def hook(kind):
         return [{"hooks": [{"type": "command", "timeout": 15,
                             "command": "curl -s -m 10 -X POST --data-binary @- '%s' >/dev/null" % _hook_url(name, kind)}]}]
-    return {"theme": CLAUDE_THEME, "hooks": {"Stop": hook("stop"), "Notification": hook("notify")}}
+    return {"theme": CLAUDE_THEME, "hooks": {"Notification": hook("notify")}}
 
 
 def _session_system_prompt(name):
@@ -1231,14 +1270,147 @@ def _tg_relay(name, text, reply=True):
             _tg_update_chat(cid, reply_to=None)
 
 
+# ---- reply relay: read finished answers from each agent's own conversation store
+
+OPENCODE_DB = os.path.expanduser(os.environ.get("STAIRWAY_OPENCODE_DB", "~/.local/share/opencode/opencode.db"))
+_relay_state = {}  # name -> agent-specific position
+
+
+def _ro_db(path):
+    return sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+
+
+def _claude_replies(name, path, st):
+    """New final answers in the newest Claude Code transcript of this folder."""
+    proj = os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", path))
+    try:
+        files = sorted((os.path.getmtime(os.path.join(proj, f)), f) for f in os.listdir(proj) if f.endswith(".jsonl"))
+    except FileNotFoundError:
+        files = []
+    if not files:
+        st.setdefault("file", None)  # the first transcript to appear is a new session: read it from the start
+        return []
+    newest = os.path.join(proj, files[-1][1])
+    if st.get("file") != newest:
+        # a new session starts from its beginning; on the first look, skip what was already there
+        offset = os.path.getsize(newest) if "file" not in st else 0
+        st.update(file=newest, offset=offset, pending=[])
+    out, size = [], os.path.getsize(newest)
+    if size > st["offset"]:
+        with open(newest, "rb") as f:
+            f.seek(st["offset"])
+            chunk = f.read(size - st["offset"])
+        complete = chunk[:chunk.rfind(b"\n") + 1]
+        st["offset"] += len(complete)
+        for line in complete.splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            m = e.get("message") or {}
+            if e.get("type") == "assistant" and not e.get("isSidechain") and m.get("stop_reason") == "end_turn":
+                st["pending"] += [b.get("text", "") for b in m.get("content", [])
+                                  if isinstance(b, dict) and b.get("type") == "text"]
+        if complete:
+            return []  # still writing: wait for a quiet poll before posting
+    if st.get("pending"):
+        out, st["pending"] = ["\n\n".join(t for t in st["pending"] if t.strip())], []
+    return out
+
+
+def _opencode_replies(name, path, st):
+    if not os.path.exists(OPENCODE_DB):
+        return []
+    db = _ro_db(OPENCODE_DB)
+    try:
+        rows = db.execute("select m.id, m.time_created, m.data from message m join session s on s.id = m.session_id "
+                          "where s.directory = ? and m.time_created > ? order by m.time_created",
+                          (path, st.get("since", 0))).fetchall()
+        if "since" not in st:
+            st["since"] = rows[-1][1] if rows else int(time.time() * 1000)
+            return []
+        out = []
+        for mid, created, data in rows:
+            m = json.loads(data)
+            if m.get("role") != "assistant":
+                st["since"] = created
+                continue
+            if not (m.get("time") or {}).get("completed"):
+                break  # still running: look again later
+            st["since"] = created
+            if m.get("error"):
+                err = m["error"].get("data", {}).get("message") or m["error"].get("name")
+                out.append("⚠️ %s error: %s" % (name, err))
+            elif m.get("finish") not in ("tool-calls", "tool_calls"):
+                parts = [json.loads(d) for (d,) in db.execute("select data from part where message_id = ? "
+                                                              "order by time_created", (mid,))]
+                text = "\n\n".join(p.get("text", "") for p in parts if p.get("type") == "text" and not p.get("synthetic"))
+                if text.strip():
+                    out.append(text)
+        return out
+    finally:
+        db.close()
+
+
+def _crush_replies(name, path, st):
+    dbpath = os.path.join(path, ".crush", "crush.db")
+    if not os.path.exists(dbpath):
+        return []
+    db = _ro_db(dbpath)
+    try:
+        rows = db.execute("select id, created_at, finished_at, parts from messages where role = 'assistant' "
+                          "and created_at >= ? order by created_at", (st.get("since", 0),)).fetchall()
+        if "since" not in st:
+            st.update(since=int(time.time()), seen=[r[0] for r in rows])
+            return []
+        out = []
+        for mid, created, finished, parts in rows:
+            if mid in st["seen"]:
+                continue
+            if not finished:
+                break
+            st["seen"] = (st["seen"] + [mid])[-200:]
+            st["since"] = created
+            parts = json.loads(parts)
+            fin = next((p["data"] for p in parts if p.get("type") == "finish"), {})
+            if fin.get("reason") == "error":
+                out.append("⚠️ %s error: %s %s" % (name, fin.get("message", ""), fin.get("details", "")))
+            elif fin.get("reason") not in ("tool_use", "tool_calls"):
+                text = "\n\n".join(p["data"].get("text", "") for p in parts if p.get("type") == "text")
+                if text.strip():
+                    out.append(text)
+        return out
+    finally:
+        db.close()
+
+
+REPLY_READERS = {"claude": _claude_replies, "opencode": _opencode_replies, "crush": _crush_replies}
+
+
+def _relay_loop():
+    while True:
+        time.sleep(3)
+        try:
+            bound = {c.get("experiment") for c in _tg_load()["chats"].values() if c.get("approved")}
+            reg, running = _load(), _screens(RC_PREFIX)
+            for name in bound:
+                entry = reg.get(name)
+                if not entry or name not in running or entry.get("mode", "server") != "session":
+                    _relay_state.pop(name, None)
+                    continue
+                st = _relay_state.setdefault(name, {})
+                for text in REPLY_READERS[entry.get("agent", "claude")](name, entry["path"], st):
+                    _tg_relay(name, text)
+        except Exception as e:
+            sys.stderr.write("stairway: relay: %s\n" % e)
+
+
 def handle_hook(name, kind, payload):
     """Called by the session's hooks (POST /hooks/<name>/<kind>)."""
     if not TG_TOKEN or not _tg_bound(name):
         return {"ok": False, "error": "no Telegram chat is bound to %s" % name}
     if kind == "stop":
-        text = (payload.get("last_assistant_message") or "").strip()
-        if text:
-            threading.Thread(target=_tg_relay, args=(name, text), daemon=True).start()
+        pass  # replies are relayed by the transcript watcher (_relay_loop); sessions started earlier still call this
     elif kind == "notify":
         msg = payload.get("message") or ""
         if payload.get("notification_type") == "idle_prompt" or "waiting for your input" in msg:
@@ -1338,9 +1510,6 @@ def _tg_command(cid, chat, msg, cmd, arg):
             raise ValueError("%s runs in server mode, which can't receive prompts. Restart it in session mode on "
                              "/status first." % arg.strip())
         _tg_update_chat(cid, experiment=arg.strip())
-        if entry.get("agent", "claude") != "claude":
-            return _tg_say(cid, "Bound %s (%s) to this chat. Messages for it are typed into its session, but its "
-                                "replies aren't relayed automatically: use /screen to read them." % (arg.strip(), _agent_label(entry)))
         return _tg_say(cid, "Bound %s to this chat. Its replies will be posted here." % arg.strip())
     if cmd == "unbind":
         _tg_update_chat(cid, experiment=None, reply_to=None)
@@ -1459,17 +1628,28 @@ def _tg_handle_logged(update):
         sys.stderr.write("stairway: telegram update failed: %s\n" % e)
 
 
+def _tg_pending_cards():
+    e = html.escape
+    return ["".join((
+        '<div class="card attention"><div class="top"><strong>%s</strong><span class="badge pending">Telegram chat'
+        '</span></div><p class="muted">%s added the bot to this %s. Approving lets its members prompt the bound '
+        'experiment, answer permission prompts and read its files.</p><div class="actions">%s%s</div></div>'
+        % (e(c.get("title") or cid), e(c.get("added_by", "someone")), e(c.get("type", "chat")),
+           _button("tg-approve", cid, "Approve", "primary"), _button("tg-reject", cid, "Reject", "danger"))))
+        for cid, c in sorted(_tg_load()["chats"].items()) if not c.get("approved")] if TG_TOKEN else []
+
+
 def _tg_section():
     e = html.escape
-    out = ["<h2>Telegram</h2>"]
+    out = ['<h2 id="telegram">Telegram</h2>']
     if not TG_TOKEN:
         return out[0] + ('<p class="muted">Not configured. Create a bot with @BotFather, put its token in '
                          'STAIRWAY_TELEGRAM_TOKEN in .env and restart stairway.</p>')
     out.append('<p class="muted">Bot %s. Add it to a group, approve the group here, then use /new or /bind in '
                'the group.</p>' % (e("@" + _tg_me["username"]) if _tg_me.get("username") else "(connecting…)"))
-    chats = _tg_load()["chats"]
+    chats = {k: v for k, v in _tg_load()["chats"].items() if v.get("approved")}
     if not chats:
-        out.append('<p class="muted">No chats yet.</p>')
+        out.append('<p class="muted">No approved chats yet.</p>')
     sessions = sorted(n for n, x in _load().items() if x.get("approved") and x.get("mode") == "session")
     for cid, c in sorted(chats.items(), key=lambda kv: kv[1].get("title") or ""):
         acts = []
@@ -1962,6 +2142,7 @@ def main():
           % (HOST, PORT, ROOT, CODE_SERVER), file=sys.stderr)
     if TG_TOKEN:
         threading.Thread(target=_tg_loop, daemon=True).start()
+        threading.Thread(target=_relay_loop, daemon=True).start()
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 
 
