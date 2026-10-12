@@ -1,0 +1,8 @@
+# secrets and runtime data
+.env
+state/
+experiments/
+# site-specific deployment (see examples/ for templates)
+deploy/
+__pycache__/
+*.pyc

@@ -1,0 +1,16 @@
+[Unit]
+Description=stairway MCP server (experiment folders + claude remote-control + VS Code)
+After=network.target
+
+[Service]
+WorkingDirectory=/srv/stairway
+EnvironmentFile=/srv/stairway/.env
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/root
+ExecStart=/usr/bin/python3 /srv/stairway/stairway.py
+Restart=on-failure
+# remote-control and VS Code instances live in their own screens and survive restarts
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
