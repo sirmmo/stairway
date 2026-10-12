@@ -37,6 +37,10 @@ phone, in a browser VS Code that stairway starts on demand, or from a Telegram g
   You can upload files by dragging them in.
 - **Telegram mode.** Add the bot to a group and approve the group. Then talk to the experiment's Claude by
   mentioning the bot. Its replies, permission requests and files come back to the group.
+- **Other coding agents too.** Claude Code is the default, but an experiment can run
+  [opencode](https://opencode.ai) or [crush](https://github.com/charmbracelet/crush) instead. They use any
+  OpenAI-compatible provider ([OpenRouter](https://openrouter.ai) by default), and you can pick the model per
+  experiment.
 - **Small and dependency-free.** About 1,700 lines of Python 3.8+ with no third-party packages. Claude sessions
   run inside GNU `screen`, so they survive stairway restarts.
 
@@ -44,10 +48,17 @@ phone, in a browser VS Code that stairway starts on demand, or from a Telegram g
 
 Each experiment is a folder plus a detached `screen` named `stairway.<name>` that runs Claude Code:
 
-| run mode | what runs | receives prompts |
+| agent / run mode | what runs | receives prompts |
 |---|---|---|
-| `session` (default) | `claude --remote-control <name> [prompt]`: one interactive session | yes: `send_prompt`, `/status`, Telegram, VS Code terminal |
-| `server` | `claude remote-control`: spawns sessions on demand from claude.ai/code | no |
+| `claude`, `session` (default) | `claude --remote-control <name> [prompt]`: one interactive session | yes: `send_prompt`, `/status`, Telegram, VS Code terminal |
+| `claude`, `server` | `claude remote-control`: spawns sessions on demand from claude.ai/code | no |
+| `opencode` | `opencode <folder> --model <provider>/<model> [--prompt …]`, via the OpenAI-compatible provider | yes |
+| `crush` | `crush --cwd <folder>`, with a generated config for the provider; stairway types the first prompt in | yes |
+
+Non-Claude agents always run in session mode. They have no claude.ai/code link, and their replies aren't
+relayed to Telegram (use `/screen`). Their configs live in `state/agents/<name>/`, so your global opencode and
+crush settings are untouched. The experiment's `permission_mode` maps to each agent's own permission settings;
+for example, `bypassPermissions` becomes crush's `--yolo`.
 
 stairway answers Claude Code's one-time "trust this folder?" question itself. It only does so for folders it
 created, or that you approved. In session mode, Claude Code hooks report each finished reply and each
@@ -63,6 +74,8 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - HTTPS in front of stairway (a reverse proxy or a tunnel), because claude.ai connectors require it
 - Optional: [code-server](https://github.com/coder/code-server) 4.x for the browser VS Code
 - Optional: a Telegram bot token from [@BotFather](https://t.me/BotFather)
+- Optional: [opencode](https://opencode.ai) and/or [crush](https://github.com/charmbracelet/crush), plus an API
+  key for an OpenAI-compatible provider (OpenRouter by default)
 
 ## Quick start
 
@@ -92,10 +105,10 @@ Put it behind HTTPS (see [docs/deployment.md](docs/deployment.md)). Then:
 
 | tool | what it does |
 |---|---|
-| `create_experiment(name, prompt?, mode?, permission_mode?, spawn?, git_init?, start?)` | create `<root>/<name>` and start Claude, working on `prompt` right away |
-| `attach_folder(path, name?, prompt?, mode?, permission_mode?, spawn?)` | ask to use an existing folder. It waits for your approval on `/status` |
+| `create_experiment(name, prompt?, agent?, model?, mode?, permission_mode?, spawn?, git_init?, start?)` | create `<root>/<name>` and start the agent (Claude Code by default), working on `prompt` right away |
+| `attach_folder(path, name?, prompt?, agent?, model?, mode?, permission_mode?, spawn?)` | ask to use an existing folder. It waits for your approval on `/status` |
 | `send_prompt(name, prompt)` | type a prompt into a running session (it is queued if Claude is busy) |
-| `start_experiment(name, prompt?, mode?, …)` / `stop_experiment(name)` | start or stop Claude. A restart starts a new conversation |
+| `start_experiment(name, prompt?, agent?, model?, mode?, …)` / `stop_experiment(name)` | start or stop the agent. A restart starts a new conversation |
 | `experiment_status(name)` / `list_experiments()` | state, links, recent prompts, the current terminal |
 | `open_editor(name)` / `stop_editor(name)` | the experiment's browser VS Code |
 | `forget_experiment(name)` | remove it from stairway; the folder is never deleted |
@@ -115,6 +128,10 @@ All settings are environment variables, usually set in `.env`:
 | `STAIRWAY_CLAUDE` | `claude` on PATH | Claude Code binary |
 | `STAIRWAY_CLAUDE_THEME` | `dark-ansi` | theme for sessions. Keep an ANSI theme: screen 4 can't render 24-bit color |
 | `STAIRWAY_CODE_SERVER` | newest `~/.local/lib/code-server-*`, else PATH | code-server binary |
+| `STAIRWAY_PROVIDER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible API used by opencode and crush |
+| `STAIRWAY_PROVIDER_API_KEY` | `$OPENROUTER_API_KEY` | its API key; it is passed only to opencode and crush processes |
+| `STAIRWAY_PROVIDER_MODEL` | `deepseek/deepseek-v4.1-flash` | default model for opencode and crush |
+| `STAIRWAY_OPENCODE` / `STAIRWAY_CRUSH` | on PATH (or `~/.opencode/bin/opencode`) | agent binaries |
 | `STAIRWAY_TELEGRAM_TOKEN` | none | enables the Telegram bot |
 | `STAIRWAY_TELEGRAM_PERMISSION_MODE` | `acceptEdits` | permission mode for experiments created from Telegram |
 | `STAIRWAY_TELEGRAM_API` | `https://api.telegram.org` | Bot API base, mainly useful for testing |

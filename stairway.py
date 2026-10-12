@@ -24,6 +24,10 @@ Config (env):
   STAIRWAY_CLAUDE_THEME Claude theme for sessions; must be an ANSI one for screen (default: dark-ansi)
   STAIRWAY_TELEGRAM_TOKEN  optional Telegram bot token: chats approved on /status can drive session experiments
   STAIRWAY_TELEGRAM_PERMISSION_MODE  permission mode for experiments made with /new (default: acceptEdits)
+  STAIRWAY_PROVIDER_BASE_URL  OpenAI-compatible API for opencode/crush (default: https://openrouter.ai/api/v1)
+  STAIRWAY_PROVIDER_API_KEY   its API key (OPENROUTER_API_KEY also works)
+  STAIRWAY_PROVIDER_MODEL     default model for opencode/crush (default: deepseek/deepseek-v4.1-flash)
+  STAIRWAY_OPENCODE / STAIRWAY_CRUSH  agent binaries (default: on PATH, or ~/.opencode/bin/opencode)
   STAIRWAY_CODE_SERVER  code-server binary (default: newest ~/.local/lib/code-server-*/bin/code-server,
                         else code-server on PATH)
 """
@@ -62,6 +66,13 @@ PORT = int(os.environ.get("STAIRWAY_PORT", "8765"))
 CLAUDE = os.environ.get("STAIRWAY_CLAUDE") or shutil.which("claude") or "claude"
 # screen 4 can't parse 24-bit colors (they turn into red bars), so sessions use an ANSI-only theme
 CLAUDE_THEME = os.environ.get("STAIRWAY_CLAUDE_THEME", "dark-ansi")
+# Other coding agents, driven through an OpenAI-compatible provider (OpenRouter by default)
+OPENCODE = (os.environ.get("STAIRWAY_OPENCODE") or shutil.which("opencode")
+            or next((p for p in [os.path.expanduser("~/.opencode/bin/opencode")] if os.path.exists(p)), None))
+CRUSH = os.environ.get("STAIRWAY_CRUSH") or shutil.which("crush")
+PROVIDER_BASE_URL = os.environ.get("STAIRWAY_PROVIDER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+PROVIDER_API_KEY = os.environ.get("STAIRWAY_PROVIDER_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
+PROVIDER_MODEL = os.environ.get("STAIRWAY_PROVIDER_MODEL", "deepseek/deepseek-v4.1-flash")
 CODE_SERVER = (os.environ.get("STAIRWAY_CODE_SERVER")
                or (sorted(glob.glob(os.path.expanduser("~/.local/lib/code-server-*/bin/code-server"))) or [None])[-1]
                or shutil.which("code-server"))
@@ -72,6 +83,7 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 PERMISSION_MODES = ["default", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"]
 SPAWN_MODES = ["same-dir", "worktree", "session"]
 RUN_MODES = ["session", "server"]
+AGENTS = ["claude", "opencode", "crush"]
 URL_RE = re.compile(r"https://claude\.ai/code[^\s'\")\]]*")
 MAX_PROMPT = 100000
 RC_PREFIX = "stairway."
@@ -186,6 +198,13 @@ def _check_prompt(prompt):
     return prompt
 
 
+def _check_agent(agent, mode):
+    if agent not in AGENTS:
+        raise ValueError("agent must be one of %s" % AGENTS)
+    if agent != "claude" and mode == "server":
+        raise ValueError("server mode is Claude-only (claude remote-control); %s runs in session mode" % agent)
+
+
 def _check_run(mode, prompt):
     if mode not in RUN_MODES:
         raise ValueError("mode must be one of %s" % RUN_MODES)
@@ -196,10 +215,71 @@ def _check_run(mode, prompt):
 
 
 def _child_env():
-    """Environment for the Claude processes, without markers of a Claude session that started stairway."""
+    """Environment for agent processes: without markers of a Claude session that started stairway, and
+    without stairway's own secrets."""
     env = {k: v for k, v in os.environ.items()
-           if k not in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT") and not k.startswith("CLAUDE_CODE_")}
+           if k not in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "STAIRWAY_TOKEN", "STAIRWAY_TELEGRAM_TOKEN",
+                        "STAIRWAY_PROVIDER_API_KEY", "OPENROUTER_API_KEY") and not k.startswith("CLAUDE_CODE_")}
     return env
+
+
+def _agent_dir(name):
+    return os.path.join(STATE, "agents", name)
+
+
+def _agent_command(agent, name, path, permission_mode, model, prompt):
+    """Return (argv, extra env, prompt still to type) for a non-Claude agent; configs live in state/agents/<name>."""
+    if not PROVIDER_API_KEY:
+        raise ValueError("%s needs an API key: set STAIRWAY_PROVIDER_API_KEY (provider %s)" % (agent, PROVIDER_BASE_URL))
+    d = _agent_dir(name)
+    os.makedirs(d, exist_ok=True)
+    env = {"STAIRWAY_PROVIDER_API_KEY": PROVIDER_API_KEY}
+    trusting = permission_mode in ("auto", "dontAsk", "bypassPermissions")
+    if agent == "opencode":
+        if not OPENCODE:
+            raise ValueError("opencode is not installed; set STAIRWAY_OPENCODE")
+        if "openrouter.ai" in PROVIDER_BASE_URL:
+            pid, provider = "openrouter", {"options": {"apiKey": "{env:STAIRWAY_PROVIDER_API_KEY}"}, "models": {model: {}}}
+            env["OPENROUTER_API_KEY"] = PROVIDER_API_KEY
+        else:
+            pid, provider = "stairway", {"npm": "@ai-sdk/openai-compatible", "name": "stairway provider",
+                                         "options": {"baseURL": PROVIDER_BASE_URL,
+                                                     "apiKey": "{env:STAIRWAY_PROVIDER_API_KEY}"},
+                                         "models": {model: {"name": model}}}
+        ask = "allow" if trusting else "ask"
+        config = {"$schema": "https://opencode.ai/config.json", "autoupdate": False, "share": "disabled",
+                  "provider": {pid: provider}, "model": "%s/%s" % (pid, model),
+                  "permission": {"edit": "allow" if trusting or permission_mode == "acceptEdits" else "ask",
+                                 "bash": ask, "webfetch": ask}}
+        cfg = os.path.join(d, "opencode.json")
+        with open(cfg, "w") as f:
+            json.dump(config, f, indent=2)
+        env.update(OPENCODE_CONFIG=cfg, OPENCODE_DISABLE_AUTOUPDATE="1")
+        # opencode always draws in 24-bit color, which screen 4 can't show: run it through the tty256 filter
+        argv = [sys.executable, os.path.abspath(__file__), "tty256", OPENCODE, path, "--model", "%s/%s" % (pid, model)]
+        if permission_mode == "plan":
+            argv += ["--agent", "plan"]
+        return argv + (["--prompt", prompt] if prompt else []), env, None
+    if agent == "crush":
+        if not CRUSH:
+            raise ValueError("crush is not installed; set STAIRWAY_CRUSH")
+        selected = {"model": model, "provider": "stairway"}
+        config = {"$schema": "https://charm.land/crush.json",
+                  "providers": {"stairway": {"name": urlsplit(PROVIDER_BASE_URL).hostname, "type": "openai-compat",
+                                             "base_url": PROVIDER_BASE_URL, "api_key": "$STAIRWAY_PROVIDER_API_KEY",
+                                             "discover_models": True,
+                                             "models": [{"id": model, "name": model, "context_window": 128000,
+                                                         "default_max_tokens": 16000}]}},
+                  "models": {"large": selected, "small": selected},
+                  "options": {"disable_metrics": True, "disable_provider_auto_update": True}}
+        if permission_mode == "acceptEdits":
+            config["permissions"] = {"allowed_tools": ["view", "ls", "grep", "glob", "edit", "multiedit", "write"]}
+        os.makedirs(os.path.join(d, "crush-config"), exist_ok=True)
+        with open(os.path.join(d, "crush-config", "crush.json"), "w") as f:
+            json.dump(config, f, indent=2)
+        env.update(CRUSH_GLOBAL_CONFIG=os.path.join(d, "crush-config"), CRUSH_GLOBAL_DATA=os.path.join(d, "crush-data"))
+        return [CRUSH, "--cwd", path] + (["--yolo"] if trusting else []), env, prompt  # no prompt flag: type it
+    raise ValueError("agent must be one of %s" % AGENTS)
 
 
 def _stuff(session, keys):
@@ -241,13 +321,16 @@ def _tail(text, n=15):
     return "\n".join(text.splitlines()[-n:])
 
 
-def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=None):
+def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=None, agent=None, model=None):
     entry = _get(name)
     path = entry["path"]
     permission_mode = permission_mode or entry.get("permission_mode", "default")
     spawn = spawn or entry.get("spawn", "same-dir")
-    mode = mode or entry.get("mode", "server")
+    agent = agent or entry.get("agent", "claude")
+    model = model or entry.get("model") or PROVIDER_MODEL
+    mode = "session" if agent != "claude" else (mode or entry.get("mode", "server"))
     prompt = prompt or entry.get("initial_prompt")
+    _check_agent(agent, mode)
     if not os.path.isdir(path):
         raise ValueError("folder %s no longer exists" % path)
     if permission_mode not in PERMISSION_MODES:
@@ -260,14 +343,19 @@ def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=N
     if name in _screens(RC_PREFIX):
         hint = " Use send_prompt to give it instructions." if prompt and mode == "session" else ""
         return "Experiment %r is already running.%s" % (name, hint)
-    _update(name, permission_mode=permission_mode, spawn=spawn, mode=mode, initial_prompt=None)
-    if mode == "session":
+    _update(name, permission_mode=permission_mode, spawn=spawn, mode=mode, initial_prompt=None, agent=agent,
+            model=model if agent != "claude" else None)
+    env, to_type = _child_env(), None
+    if agent != "claude":
+        cmd, extra, to_type = _agent_command(agent, name, path, permission_mode, model, prompt)
+        env.update(extra)
+    elif mode == "session":
         cmd = [CLAUDE, "--remote-control", name, "--permission-mode", permission_mode,
                "--settings", json.dumps(_session_settings(name)),
                "--append-system-prompt", _session_system_prompt(name)] + ([prompt] if prompt else [])
     else:
         cmd = [CLAUDE, "remote-control", "--name", name, "--permission-mode", permission_mode, "--spawn", spawn]
-    subprocess.run(["screen", "-U", "-T", "screen-256color", "-dmS", RC_PREFIX + name] + cmd, cwd=path, env=_child_env(), check=True)
+    subprocess.run(["screen", "-U", "-T", "screen-256color", "-dmS", RC_PREFIX + name] + cmd, cwd=path, env=env, check=True)
     if prompt:
         _log_prompt(name, "start", prompt)
 
@@ -277,7 +365,7 @@ def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=N
         time.sleep(1)
         session = _screens(RC_PREFIX).get(name)
         if not session:
-            return "Claude for %r exited right away. Last output:\n\n%s" % (name, text)
+            return "%s for %r exited right away. Last output:\n\n%s" % (agent, name, text)
         text = _screen_text(session)
         if _answer_trust(session, text):
             settled = 0
@@ -287,11 +375,20 @@ def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=N
             _update(name, url=url)
         if mode == "server" and "Connected" in text:
             break
-        settled += 1
-        if mode == "session" and (url or settled >= 8):
+        settled += 1 if text.strip() else 0
+        if mode == "session" and (url or settled >= (8 if agent == "claude" else 5)):
             break
-    what = ("an interactive Claude session (remote control on)%s" % (", working on the prompt" if prompt else "")
-            if mode == "session" else "`claude remote-control` (spawn: %s)" % spawn)
+    if to_type and name in _screens(RC_PREFIX):
+        _type_prompt(_screens(RC_PREFIX)[name], to_type)
+        time.sleep(2)
+        text = _screen_text(_screens(RC_PREFIX)[name])
+    if agent != "claude":
+        what = "%s with %s via %s%s" % (agent, model, urlsplit(PROVIDER_BASE_URL).hostname,
+                                        ", working on the prompt" if prompt else "")
+    elif mode == "session":
+        what = "an interactive Claude session (remote control on)%s" % (", working on the prompt" if prompt else "")
+    else:
+        what = "`claude remote-control` (spawn: %s)" % spawn
     return ("Started %s for %r in %s (permission mode: %s).%s Current screen:\n\n%s"
             % (what, name, path, permission_mode, " claude.ai/code: %s." % url if url else "", _tail(text)))
 
@@ -313,10 +410,13 @@ def send_prompt(name, prompt):
 
 
 def create_experiment(name, permission_mode="default", spawn="same-dir", git_init=True, start=True,
-                      mode="session", prompt=None):
+                      mode="session", prompt=None, agent="claude", model=None):
     if not NAME_RE.match(name or ""):
         raise ValueError("name must match %s" % NAME_RE.pattern)
     path = os.path.join(ROOT, name)
+    if agent != "claude":
+        mode = "session"
+    _check_agent(agent, mode)
     _check_run(mode, prompt)
     with _lock:
         reg = _load()
@@ -325,7 +425,8 @@ def create_experiment(name, permission_mode="default", spawn="same-dir", git_ini
         if os.path.exists(path):
             raise ValueError("%s already exists; use attach_folder for existing folders" % path)
         os.makedirs(path)
-        reg[name] = {"path": path, "origin": "created", "approved": True, "mode": mode,
+        reg[name] = {"path": path, "origin": "created", "approved": True, "mode": mode, "agent": agent,
+                     "model": model if agent != "claude" else None,
                      "permission_mode": permission_mode, "spawn": spawn, "initial_prompt": prompt or None}
         _save(reg)
     msg = ["Created %s." % path]
@@ -333,7 +434,7 @@ def create_experiment(name, permission_mode="default", spawn="same-dir", git_ini
         subprocess.run(["git", "init", "-q"], cwd=path, check=True)
         msg.append("Initialized a git repository.")
     if start:
-        msg.append(start_experiment(name, permission_mode, spawn, mode))
+        msg.append(start_experiment(name, permission_mode, spawn, mode, agent=agent, model=model))
     return " ".join(msg)
 
 
@@ -341,7 +442,8 @@ def _inside(path, root):
     return path != root and path.startswith(root.rstrip(os.sep) + os.sep)
 
 
-def _register_folder(path, name, permission_mode, spawn, approved, mode="session", prompt=None):
+def _register_folder(path, name, permission_mode, spawn, approved, mode="session", prompt=None, agent="claude",
+                     model=None):
     """Register an existing folder; return (name, message). Only the status page passes approved=True."""
     real = os.path.realpath(os.path.expanduser(path))
     if not os.path.isdir(real):
@@ -350,6 +452,9 @@ def _register_folder(path, name, permission_mode, spawn, approved, mode="session
         raise ValueError("only folders inside %s can be attached" % ", ".join(ALLOW))
     if permission_mode not in PERMISSION_MODES or spawn not in SPAWN_MODES:
         raise ValueError("permission_mode must be one of %s, spawn one of %s" % (PERMISSION_MODES, SPAWN_MODES))
+    if agent != "claude":
+        mode = "session"
+    _check_agent(agent, mode)
     _check_run(mode, prompt)
     with _lock:
         reg = _load()
@@ -368,13 +473,15 @@ def _register_folder(path, name, permission_mode, spawn, approved, mode="session
             while name in reg:
                 name, n = "%s-%d" % (base, n), n + 1
         reg[name] = {"path": real, "origin": "attached", "approved": approved, "requested_at": int(time.time()),
-                     "mode": mode, "permission_mode": permission_mode, "spawn": spawn, "initial_prompt": prompt or None}
+                     "mode": mode, "agent": agent, "model": model if agent != "claude" else None,
+                     "permission_mode": permission_mode, "spawn": spawn, "initial_prompt": prompt or None}
         _save(reg)
     return name, None
 
 
-def attach_folder(path, name=None, permission_mode="default", spawn="same-dir", mode="session", prompt=None):
-    name, msg = _register_folder(path, name, permission_mode, spawn, False, mode, prompt)
+def attach_folder(path, name=None, permission_mode="default", spawn="same-dir", mode="session", prompt=None,
+                  agent="claude", model=None):
+    name, msg = _register_folder(path, name, permission_mode, spawn, False, mode, prompt, agent, model)
     if msg:
         return msg
     real = _load()[name]["path"]
@@ -418,6 +525,11 @@ def forget_experiment(name):
     return "Forgot %r. Its folder %s was left untouched." % (name, entry["path"])
 
 
+def _agent_label(entry):
+    agent = entry.get("agent", "claude")
+    return agent if agent == "claude" else "%s (%s)" % (agent, entry.get("model") or PROVIDER_MODEL)
+
+
 def _state(name, entry, rc):
     if not entry.get("approved"):
         return "awaiting approval"
@@ -428,16 +540,17 @@ def list_experiments():
     reg, rc, code = _load(), _screens(RC_PREFIX), _screens(CODE_PREFIX)
     if not reg:
         return "No experiments yet. New ones go in %s." % ROOT
-    return "\n".join("%s\t%s\t%s mode\teditor %s\t%s\t%s" % (
-        n, _state(n, e, rc), e.get("mode", "server"), "open" if n in code else "closed", e["origin"], e["path"])
+    return "\n".join("%s\t%s\t%s\t%s mode\teditor %s\t%s\t%s" % (
+        n, _state(n, e, rc), _agent_label(e), e.get("mode", "server"), "open" if n in code else "closed",
+        e["origin"], e["path"])
         for n, e in sorted(reg.items()))
 
 
 def experiment_status(name):
     entry = _get(name, approved=False)
     rc = _screens(RC_PREFIX)
-    lines = ["%r: %s, %s mode, %s folder %s" % (name, _state(name, entry, rc), entry.get("mode", "server"),
-                                                entry["origin"], entry["path"])]
+    lines = ["%r: %s, %s, %s mode, %s folder %s" % (name, _state(name, entry, rc), _agent_label(entry),
+                                                    entry.get("mode", "server"), entry["origin"], entry["path"])]
     for p in _prompts(name, 3):
         lines.append("prompt (%s, %s): %s" % (p["source"], time.strftime("%Y-%m-%d %H:%M", time.localtime(p["at"])),
                                               p["text"][:200] + ("…" if len(p["text"]) > 200 else "")))
@@ -579,6 +692,12 @@ RUN_MODE = {"type": "string", "enum": RUN_MODES, "default": "session",
 PROMPT = {"type": "string",
           "description": "First prompt for the experiment's Claude (session mode): the brief agreed in this "
                          "conversation, e.g. goal, constraints, first steps. It starts working on it right away."}
+AGENT = {"type": "string", "enum": AGENTS, "default": "claude",
+         "description": "Coding agent to run: claude (Claude Code, the default, with remote control), or opencode / "
+                        "crush using the server's OpenAI-compatible provider (%s). Non-Claude agents run in session "
+                        "mode and have no claude.ai/code link." % PROVIDER_BASE_URL}
+MODEL = {"type": "string",
+         "description": "Model for opencode/crush, as the provider names it (default %s)." % PROVIDER_MODEL}
 NAME_ONLY = {"type": "object", "required": ["name"], "properties": {"name": NAME}}
 READ_ONLY = {"readOnlyHint": True, "openWorldHint": False}
 
@@ -588,7 +707,8 @@ TOOLS = {
                        "Claude in it with remote control, so it shows up in claude.ai/code. Pass `prompt` to brief it "
                        "with what was decided in this conversation; it starts working right away." % ROOT,
         "inputSchema": {"type": "object", "required": ["name"], "properties": {
-            "name": NAME, "prompt": PROMPT, "mode": RUN_MODE, "permission_mode": MODE, "spawn": SPAWN,
+            "name": NAME, "prompt": PROMPT, "agent": AGENT, "model": MODEL, "mode": RUN_MODE,
+            "permission_mode": MODE, "spawn": SPAWN,
             "git_init": {"type": "boolean", "default": True, "description": "Run `git init` in the new folder."},
             "start": {"type": "boolean", "default": True, "description": "Start remote-control right away."}}},
     }),
@@ -598,13 +718,15 @@ TOOLS = {
         "inputSchema": {"type": "object", "required": ["path"], "properties": {
             "path": {"type": "string", "description": "Absolute path of the existing folder."},
             "name": dict(NAME, description="Optional experiment name; defaults to the folder name."),
-            "prompt": PROMPT, "mode": RUN_MODE, "permission_mode": MODE, "spawn": SPAWN}},
+            "prompt": PROMPT, "agent": AGENT, "model": MODEL, "mode": RUN_MODE, "permission_mode": MODE,
+            "spawn": SPAWN}},
     }),
     "start_experiment": (start_experiment, {
         "description": "(Re)start Claude for an experiment, optionally with a first prompt. Without options it "
                        "reuses the last mode and permission settings. A restarted session starts a new conversation.",
         "inputSchema": {"type": "object", "required": ["name"], "properties": {
-            "name": NAME, "prompt": PROMPT, "mode": RUN_MODE, "permission_mode": MODE, "spawn": SPAWN}},
+            "name": NAME, "prompt": PROMPT, "agent": AGENT, "model": MODEL, "mode": RUN_MODE,
+            "permission_mode": MODE, "spawn": SPAWN}},
     }),
     "send_prompt": (send_prompt, {
         "description": "Type a prompt into a running session-mode experiment, as if the user typed it: use it to "
@@ -794,9 +916,11 @@ def _connect_section(base):
 
 
 def _new_section():
-    modes = ("<label>Run mode%s</label><label>Permission mode%s</label><label>Spawn (server mode)%s</label>"
+    modes = ("<label>Agent%s</label><label>Model (opencode/crush)<input name=\"model\" placeholder=\"%s\"></label>"
+             "<label>Run mode (Claude)%s</label><label>Permission mode%s</label><label>Spawn (server mode)%s</label>"
              "<label>First prompt (session mode, optional)<textarea name=\"prompt\" rows=\"4\" "
              "placeholder=\"What should Claude do first?\"></textarea></label>") % (
+        _select("agent", AGENTS, "claude"), html.escape(PROVIDER_MODEL),
         _select("mode", RUN_MODES, "session"), _select("permission_mode", PERMISSION_MODES, "default"),
         _select("spawn", SPAWN_MODES, "same-dir"))
     return (
@@ -880,10 +1004,10 @@ def status_page(flash="", base=""):
                 for p in reversed(history)))
         out.append(
             '<div class="card"><div class="top"><strong>%s</strong><span class="badge %s">%s</span>%s'
-            '<span class="muted" style="font-size:12px">%s mode &middot; %s &middot; %s</span></div>'
+            '<span class="muted" style="font-size:12px">%s &middot; %s mode &middot; %s &middot; %s</span></div>'
             '<div class="path">%s</div><div class="actions">%s</div>%s</div>'
             % (e(n), state, state, ' <span class="badge running">VS Code open</span>' if n in code else "",
-               e(mode), e(x["origin"]), e(x.get("permission_mode", "default")),
+               e(_agent_label(x)), e(mode), e(x["origin"]), e(x.get("permission_mode", "default")),
                e(x["path"]), "".join(acts), extra))
     return _page("stairway status", "".join(out) + COPY_JS)
 
@@ -900,13 +1024,15 @@ def login_page(next_path, error=""):
 def _form_create(f):
     return create_experiment(f.get("name", "").strip(), f.get("permission_mode", "default"),
                              f.get("spawn", "same-dir"), git_init=f.get("git_init") == "on",
-                             mode=f.get("mode", "session"), prompt=f.get("prompt", "").strip() or None)
+                             mode=f.get("mode", "session"), prompt=f.get("prompt", "").strip() or None,
+                             agent=f.get("agent", "claude"), model=f.get("model", "").strip() or None)
 
 
 def _form_attach(f):
     name, msg = _register_folder(f.get("path", "").strip(), f.get("name", "").strip() or None,
                                  f.get("permission_mode", "default"), f.get("spawn", "same-dir"), True,
-                                 f.get("mode", "session"), f.get("prompt", "").strip() or None)
+                                 f.get("mode", "session"), f.get("prompt", "").strip() or None,
+                                 f.get("agent", "claude"), f.get("model", "").strip() or None)
     if msg:
         return msg
     _approve(name)
@@ -945,7 +1071,7 @@ PHOTO_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 _tg_me = {}
 TG_COMMANDS = [
     ("ask", "Send a message to the experiment's Claude"),
-    ("new", "<name> [brief]: create an experiment and bind it here"),
+    ("new", "<name> [claude|opencode|crush] [brief]: create an experiment and bind it here"),
     ("bind", "<name>: bind an existing session-mode experiment here"),
     ("unbind", "Unbind the experiment from this chat"),
     ("status", "Experiment state and links"),
@@ -1192,12 +1318,16 @@ def _tg_command(cid, chat, msg, cmd, arg):
         return _tg_prompt(cid, chat, msg, arg) if arg else _tg_say(cid, "Usage: /ask <message>")
     if cmd == "new":
         new, _, brief = arg.partition(" ")
+        agent = "claude"
+        first, _, rest = brief.strip().partition(" ")
+        if first.lower() in AGENTS:
+            agent, brief = first.lower(), rest
         if not new:
-            return _tg_say(cid, "Usage: /new <name> [brief]")
+            return _tg_say(cid, "Usage: /new <name> [claude|opencode|crush] [brief]")
         _tg_say(cid, "Creating %s…" % new)
         prompt = ("[Telegram, %s in %s]\n%s" % (_tg_sender(msg), chat.get("title") or "a private chat", brief.strip())
                   if brief.strip() else None)
-        create_experiment(new.lower(), TG_PERMISSION_MODE, mode="session", prompt=prompt)
+        create_experiment(new.lower(), TG_PERMISSION_MODE, mode="session", prompt=prompt, agent=agent)
         _tg_update_chat(cid, experiment=new.lower(), reply_to=msg["message_id"] if prompt else None)
         entry = _get(new.lower())
         return _tg_say(cid, "Created and bound %s (%s).%s" % (new.lower(), entry["path"],
@@ -1208,6 +1338,9 @@ def _tg_command(cid, chat, msg, cmd, arg):
             raise ValueError("%s runs in server mode, which can't receive prompts. Restart it in session mode on "
                              "/status first." % arg.strip())
         _tg_update_chat(cid, experiment=arg.strip())
+        if entry.get("agent", "claude") != "claude":
+            return _tg_say(cid, "Bound %s (%s) to this chat. Messages for it are typed into its session, but its "
+                                "replies aren't relayed automatically: use /screen to read them." % (arg.strip(), _agent_label(entry)))
         return _tg_say(cid, "Bound %s to this chat. Its replies will be posted here." % arg.strip())
     if cmd == "unbind":
         _tg_update_chat(cid, experiment=None, reply_to=None)
@@ -1729,7 +1862,97 @@ class Handler(BaseHTTPRequestHandler):
                                            self.address_string(), re.sub(r"k=[0-9a-f]+", "k=<key>", re.sub(r"/mcp/[^ ]+", "/mcp/<token>", fmt % args))))
 
 
+# ---------------------------------------------------------------- tty256: 24-bit color -> 256 colors
+# `stairway.py tty256 <cmd...>` runs cmd in a pseudo-terminal and rewrites 24-bit color codes
+# (ESC[38;2;r;g;bm) to the nearest xterm-256 color, because screen 4 garbles them.
+
+_CUBE = [0, 95, 135, 175, 215, 255]
+_SGR = re.compile(rb"\x1b\[([0-9;:]*)m")
+
+
+def _xterm256(r, g, b):
+    def near(v):
+        return min(range(6), key=lambda i: abs(_CUBE[i] - v))
+    ri, gi, bi = near(r), near(g), near(b)
+    cube = (16 + 36 * ri + 6 * gi + bi, (_CUBE[ri] - r) ** 2 + (_CUBE[gi] - g) ** 2 + (_CUBE[bi] - b) ** 2)
+    level = min(23, max(0, round(((r + g + b) / 3 - 8) / 10)))
+    gv = 8 + 10 * level
+    gray = (232 + level, (gv - r) ** 2 + (gv - g) ** 2 + (gv - b) ** 2)
+    return min(cube, gray, key=lambda c: c[1])[0]
+
+
+def _sgr_to_256(m):
+    t, out, i = re.split(rb"[;:]", m.group(1)), [], 0
+    while i < len(t):
+        if t[i] in (b"38", b"48", b"58") and i + 1 < len(t) and t[i + 1] == b"2":
+            rgb = t[i + 2:i + 5]
+            skip = 5
+            if len(t) >= i + 6 and rgb and rgb[0] == b"" and b":" in m.group(1):  # 38:2::r:g:b
+                rgb, skip = t[i + 3:i + 6], 6
+            try:
+                r, g, b = (int(x or 0) for x in rgb)
+                out += [t[i], b"5", str(_xterm256(r, g, b)).encode()]
+            except ValueError:
+                out.append(t[i])
+            i += skip
+            continue
+        out.append(t[i])
+        i += 1
+    return b"\x1b[" + b";".join(out) + b"m"
+
+
+def _write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def tty256(argv):
+    import fcntl, pty, signal, termios, tty
+    pid, master = pty.fork()
+    if pid == 0:
+        os.execvp(argv[0], argv)
+
+    def resize(*_):
+        try:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))
+        except OSError:
+            pass
+    signal.signal(signal.SIGWINCH, resize)
+    resize()
+    saved = termios.tcgetattr(0) if os.isatty(0) else None
+    if saved:
+        tty.setraw(0)
+    pending = b""
+    try:
+        while True:
+            ready, _, _ = select.select([0, master], [], [])
+            if 0 in ready:
+                data = os.read(0, 65536)
+                if not data:
+                    break
+                _write_all(master, data)
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:  # the child closed the terminal
+                    break
+                if not data:
+                    break
+                data, pending = pending + data, b""
+                cut = data.rfind(b"\x1b")
+                if cut >= 0 and not re.search(rb"[@-~]", data[cut + 2:]) and len(data) - cut < 64:
+                    data, pending = data[:cut], data[cut:]  # an escape sequence split across reads
+                _write_all(1, _SGR.sub(_sgr_to_256, data))
+    finally:
+        if saved:
+            termios.tcsetattr(0, termios.TCSADRAIN, saved)
+    _, status = os.waitpid(pid, 0)
+    return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+
+
 def main():
+    if sys.argv[1:2] == ["tty256"]:
+        sys.exit(tty256(sys.argv[2:]))
     sys.stderr = open(sys.stderr.fileno(), "w", buffering=1, closefd=False)  # line-buffered logs under systemd
     if len(TOKEN) < 16:
         sys.exit("Set STAIRWAY_TOKEN to a secret of at least 16 characters.")

@@ -70,6 +70,25 @@ claude --remote-control <name> --permission-mode <mode> \
 - **The ANSI theme** is there because `screen` 4.x misreads 24-bit color escape codes as other attributes,
   which shows up as red bars.
 
+## Other agents (opencode, crush)
+
+`agent=opencode` or `agent=crush` replaces Claude Code in the experiment's screen. stairway writes a
+per-experiment config to `state/agents/<name>/`, which points the agent at `STAIRWAY_PROVIDER_BASE_URL` with
+the chosen model:
+
+- **opencode:** `OPENCODE_CONFIG=state/agents/<name>/opencode.json`. On OpenRouter it uses opencode's
+  built-in `openrouter` provider; anything else gets an `@ai-sdk/openai-compatible` provider. The first prompt
+  goes in with `--prompt`. `permission_mode` maps to opencode's `permission` settings for `edit`, `bash` and
+  `webfetch`, and `plan` maps to `--agent plan`.
+- **crush:** `CRUSH_GLOBAL_CONFIG` and `CRUSH_GLOBAL_DATA` point into `state/agents/<name>/`, with an
+  `openai-compat` provider. crush has no prompt flag, so stairway types the first prompt in once the UI is up.
+  `acceptEdits` pre-allows the file tools, and `auto`, `dontAsk` and `bypassPermissions` become `--yolo`.
+- **opencode always draws in 24-bit color**, so it runs through `stairway.py tty256`. That small
+  pseudo-terminal filter rewrites `ESC[38;2;r;g;bm` codes to the nearest xterm-256 color, because screen 4.x
+  can't render 24-bit color. crush already respects `TERM=screen-256color`.
+- **Agent processes get the provider key, but not stairway's own secrets** (`STAIRWAY_TOKEN` and the
+  Telegram token). Claude sessions don't get the provider key either.
+
 ## VS Code terminals
 
 `state/code/<name>/terminal.sh` is the default terminal profile ("auto"). In session mode, if no one is
