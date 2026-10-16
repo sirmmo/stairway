@@ -115,8 +115,19 @@ Put it behind HTTPS (see [docs/deployment.md](docs/deployment.md)). Then:
 | `send_prompt(name, prompt)` | type a prompt into a running session (it is queued if Claude is busy) |
 | `start_experiment(name, prompt?, agent?, model?, mode?, …)` / `stop_experiment(name)` | start or stop the agent. A restart starts a new conversation |
 | `experiment_status(name)` / `list_experiments()` | state, links, recent prompts, the current terminal |
+| `experiment_info(name)` | the same state as JSON, for programs |
+| `experiment_files(name, path?, max_mb?)` | the folder (or a subfolder such as `deliverables`) as a base64 zip in JSON; `.git` and dependency folders are left out |
 | `open_editor(name)` / `stop_editor(name)` | the experiment's browser VS Code |
 | `forget_experiment(name)` | remove it from stairway; the folder is never deleted |
+
+## Callbacks for programs
+
+`create_experiment(…, callback_url, callback_secret)` makes stairway POST every finished reply of a session-mode
+experiment to `callback_url` as JSON: `{"experiment", "event": "reply", "text", "at", "url"}`, with the header
+`X-Stairway-Signature: sha256=<HMAC-SHA256 of the body with callback_secret>`. Replies are read from the agent's own
+transcript, the same way they reach Telegram, and failed posts are retried a few times. A task planner can hand work
+to an experiment this way, then fetch the result with `experiment_files` (for example
+[Flowly](https://github.com/flowly-org/flowly-backend)'s Stairway integration).
 
 ## Configuration
 

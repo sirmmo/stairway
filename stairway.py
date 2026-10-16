@@ -411,9 +411,10 @@ def send_prompt(name, prompt):
 
 
 def create_experiment(name, permission_mode="default", spawn="same-dir", git_init=True, start=True,
-                      mode="session", prompt=None, agent="claude", model=None):
+                      mode="session", prompt=None, agent="claude", model=None, callback_url=None, callback_secret=None):
     if not NAME_RE.match(name or ""):
         raise ValueError("name must match %s" % NAME_RE.pattern)
+    callback = _check_callback(callback_url, callback_secret)
     path = os.path.join(ROOT, name)
     if agent != "claude":
         mode = "session"
@@ -429,6 +430,8 @@ def create_experiment(name, permission_mode="default", spawn="same-dir", git_ini
         reg[name] = {"path": path, "origin": "created", "approved": True, "mode": mode, "agent": agent,
                      "model": model if agent != "claude" else None,
                      "permission_mode": permission_mode, "spawn": spawn, "initial_prompt": prompt or None}
+        if callback:
+            reg[name]["callback"] = callback
         _save(reg)
     msg = ["Created %s." % path]
     if git_init:
@@ -437,6 +440,85 @@ def create_experiment(name, permission_mode="default", spawn="same-dir", git_ini
     if start:
         msg.append(start_experiment(name, permission_mode, spawn, mode, agent=agent, model=model))
     return " ".join(msg)
+
+
+def _check_callback(url, secret):
+    """A program (e.g. a task planner) that wants each finished reply POSTed to it. None when not asked for."""
+    if not url:
+        return None
+    if not re.match(r"^https://[^\s/]+(/\S*)?$", url) and not re.match(r"^http://(localhost|127\.0\.0\.1)(:\d+)?(/\S*)?$", url):
+        raise ValueError("callback_url must be an https:// URL")
+    if not secret or len(secret) < 16:
+        raise ValueError("callback_secret must be at least 16 characters (it signs every callback)")
+    return {"url": url, "secret": secret}
+
+
+def _callback_post(name, entry, text):
+    """POST {"experiment", "event": "reply", "text", "at", "url"} with X-Stairway-Signature: sha256=HMAC(secret, body).
+    A few retries with backoff; failures are logged, never raised."""
+    cb = entry.get("callback") or {}
+    body = json.dumps({"experiment": name, "event": "reply", "text": text, "at": int(time.time()),
+                       "url": entry.get("url")}).encode()
+    sig = "sha256=" + hmac.new(cb["secret"].encode(), body, hashlib.sha256).hexdigest()
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(cb["url"], body, method="POST", headers={
+                "Content-Type": "application/json", "X-Stairway-Signature": sig, "User-Agent": "stairway"})
+            with urllib.request.urlopen(req, timeout=15) as res:
+                if res.status < 300:
+                    return
+        except Exception as e:
+            sys.stderr.write("stairway: callback for %s failed (attempt %d): %s\n" % (name, attempt + 1, e))
+        time.sleep(5 * (attempt + 1))
+
+
+def experiment_info(name):
+    """The state of an experiment as JSON, for programs (experiment_status is for people)."""
+    entry = _get(name, approved=False)
+    rc = _screens(RC_PREFIX)
+    return json.dumps({"name": name, "state": _state(name, entry, rc), "running": name in rc,
+                       "agent": entry.get("agent", "claude"), "mode": entry.get("mode", "server"),
+                       "session_url": entry.get("url"), "folder": entry["path"],
+                       "editor_url": _link("/code/%s/" % name) if name in _screens(CODE_PREFIX) else None,
+                       "callback": bool(entry.get("callback"))})
+
+
+#: Never exported: version control, dependencies, caches.
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", ".next", "dist-newstyle", "target"}
+
+
+def experiment_files(name, path="", max_mb=15):
+    """A zip (base64) of the experiment folder, or of one of its subfolders, as JSON:
+    {"files": [{path, size}], "skipped": [...], "zip_base64": ...}. Files over 5 MB and anything past max_mb are left out."""
+    import io
+    import zipfile
+
+    entry = _get(name, approved=False)
+    root = entry["path"]
+    base = os.path.realpath(os.path.join(root, path)) if path else root
+    if base != root and not _inside(base, root):
+        raise ValueError("path must stay inside the experiment folder")
+    if not os.path.isdir(base):
+        return json.dumps({"files": [], "skipped": [], "zip_base64": None})
+    budget = max(1, min(int(max_mb), 50)) * 1024 * 1024
+    files, skipped, buf = [], [], io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+            for fn in sorted(filenames):
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, base)
+                if os.path.islink(full):
+                    continue
+                size = os.path.getsize(full)
+                if size > 5 * 1024 * 1024 or size > budget:
+                    skipped.append(rel)
+                    continue
+                zf.write(full, rel)
+                budget -= size
+                files.append({"path": rel, "size": size})
+    return json.dumps({"files": files, "skipped": skipped,
+                       "zip_base64": base64.b64encode(buf.getvalue()).decode() if files else None})
 
 
 def _inside(path, root):
@@ -711,7 +793,10 @@ TOOLS = {
             "name": NAME, "prompt": PROMPT, "agent": AGENT, "model": MODEL, "mode": RUN_MODE,
             "permission_mode": MODE, "spawn": SPAWN,
             "git_init": {"type": "boolean", "default": True, "description": "Run `git init` in the new folder."},
-            "start": {"type": "boolean", "default": True, "description": "Start remote-control right away."}}},
+            "start": {"type": "boolean", "default": True, "description": "Start remote-control right away."},
+            "callback_url": {"type": "string", "description": "For programs: POST each finished reply here as JSON "
+                             "(session mode), signed with callback_secret (header X-Stairway-Signature: sha256=HMAC)."},
+            "callback_secret": {"type": "string", "description": "At least 16 characters; signs the callbacks."}}},
     }),
     "attach_folder": (attach_folder, {
         "description": "Ask to use an existing folder on the server as an experiment. The user must approve it "
@@ -747,6 +832,19 @@ TOOLS = {
     "list_experiments": (list_experiments, {
         "description": "List experiments: state, whether VS Code is open, origin (created/attached) and folder.",
         "inputSchema": {"type": "object", "properties": {}}, "annotations": READ_ONLY,
+    }),
+    "experiment_info": (experiment_info, {
+        "description": "An experiment's state as JSON (state, running, agent, mode, session_url, folder, editor_url), "
+                       "for programs; experiment_status is the human-readable version.",
+        "inputSchema": NAME_ONLY, "annotations": READ_ONLY,
+    }),
+    "experiment_files": (experiment_files, {
+        "description": "The experiment's files as a base64 zip in JSON (files over 5 MB, .git and dependency folders "
+                       "are left out). Pass `path` for one subfolder, e.g. deliverables.",
+        "inputSchema": {"type": "object", "required": ["name"], "properties": {
+            "name": NAME, "path": {"type": "string", "description": "Subfolder inside the experiment (default: all)."},
+            "max_mb": {"type": "integer", "default": 15, "description": "Cap on the zipped files, in MB (max 50)."}}},
+        "annotations": READ_ONLY,
     }),
     "experiment_status": (experiment_status, {
         "description": "Show an experiment's state, its claude.ai/code and VS Code links, "
@@ -1391,16 +1489,20 @@ def _relay_loop():
     while True:
         time.sleep(3)
         try:
-            bound = {c.get("experiment") for c in _tg_load()["chats"].values() if c.get("approved")}
+            bound = {c.get("experiment") for c in _tg_load()["chats"].values() if c.get("approved")} if TG_TOKEN else set()
             reg, running = _load(), _screens(RC_PREFIX)
-            for name in bound:
+            hooked = {n for n, e in reg.items() if e.get("callback")}
+            for name in bound | hooked:
                 entry = reg.get(name)
                 if not entry or name not in running or entry.get("mode", "server") != "session":
                     _relay_state.pop(name, None)
                     continue
                 st = _relay_state.setdefault(name, {})
                 for text in REPLY_READERS[entry.get("agent", "claude")](name, entry["path"], st):
-                    _tg_relay(name, text)
+                    if name in bound:
+                        _tg_relay(name, text)
+                    if name in hooked:
+                        threading.Thread(target=_callback_post, args=(name, entry, text), daemon=True).start()
         except Exception as e:
             sys.stderr.write("stairway: relay: %s\n" % e)
 
@@ -2142,7 +2244,8 @@ def main():
           % (HOST, PORT, ROOT, CODE_SERVER), file=sys.stderr)
     if TG_TOKEN:
         threading.Thread(target=_tg_loop, daemon=True).start()
-        threading.Thread(target=_relay_loop, daemon=True).start()
+    # Finished replies go to bound Telegram chats and to experiments' callbacks.
+    threading.Thread(target=_relay_loop, daemon=True).start()
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 
 
