@@ -453,11 +453,12 @@ def _check_callback(url, secret):
     return {"url": url, "secret": secret}
 
 
-def _callback_post(name, entry, text):
-    """POST {"experiment", "event": "reply", "text", "at", "url"} with X-Stairway-Signature: sha256=HMAC(secret, body).
+def _callback_post(name, entry, text, event="reply"):
+    """POST {"experiment", "event", "text", "at", "url"} with X-Stairway-Signature: sha256=HMAC(secret, body).
+    event: "reply" (a finished answer) or "waiting" (it asks for permission; text = what it wants to do).
     A few retries with backoff; failures are logged, never raised."""
     cb = entry.get("callback") or {}
-    body = json.dumps({"experiment": name, "event": "reply", "text": text, "at": int(time.time()),
+    body = json.dumps({"experiment": name, "event": event, "text": text, "at": int(time.time()),
                        "url": entry.get("url")}).encode()
     sig = "sha256=" + hmac.new(cb["secret"].encode(), body, hashlib.sha256).hexdigest()
     for attempt in range(4):
@@ -470,6 +471,17 @@ def _callback_post(name, entry, text):
         except Exception as e:
             sys.stderr.write("stairway: callback for %s failed (attempt %d): %s\n" % (name, attempt + 1, e))
         time.sleep(5 * (attempt + 1))
+
+
+def answer_permission(name, allow):
+    """Answer the permission question a session is showing: allow = Yes (Enter), otherwise No (Esc)."""
+    _get(name, approved=False)
+    session = _screens(RC_PREFIX).get(name)
+    if not session:
+        raise ValueError("%s is not running" % name)
+    _stuff(session, "\r" if allow else "\033")
+    time.sleep(2)
+    return _tail(_screen_text(session), 12)
 
 
 def experiment_info(name):
@@ -832,6 +844,12 @@ TOOLS = {
     "list_experiments": (list_experiments, {
         "description": "List experiments: state, whether VS Code is open, origin (created/attached) and folder.",
         "inputSchema": {"type": "object", "properties": {}}, "annotations": READ_ONLY,
+    }),
+    "answer_permission": (answer_permission, {
+        "description": "Answer the permission question a session-mode experiment is waiting on: allow=true answers "
+                       "Yes, allow=false answers No. Returns the end of its terminal.",
+        "inputSchema": {"type": "object", "required": ["name", "allow"], "properties": {
+            "name": NAME, "allow": {"type": "boolean"}}},
     }),
     "experiment_info": (experiment_info, {
         "description": "An experiment's state as JSON (state, running, agent, mode, session_url, folder, editor_url), "
@@ -1509,8 +1527,17 @@ def _relay_loop():
 
 def handle_hook(name, kind, payload):
     """Called by the session's hooks (POST /hooks/<name>/<kind>)."""
+    entry = _load().get(name) or {}
+    if kind == "notify" and entry.get("callback"):
+        msg = payload.get("message") or ""
+        idle = payload.get("notification_type") == "idle_prompt" or "waiting for your input" in msg
+        if not idle:
+            # What it wants to do: the permission prompt on its screen, else the hook's message.
+            session = _screens(RC_PREFIX).get(name)
+            shown = _tail(_screen_text(session), 25) if session else ""
+            threading.Thread(target=_callback_post, args=(name, entry, shown or msg, "waiting"), daemon=True).start()
     if not TG_TOKEN or not _tg_bound(name):
-        return {"ok": False, "error": "no Telegram chat is bound to %s" % name}
+        return {"ok": bool(entry.get("callback")), "error": None if entry.get("callback") else "no Telegram chat is bound to %s" % name}
     if kind == "stop":
         pass  # replies are relayed by the transcript watcher (_relay_loop); sessions started earlier still call this
     elif kind == "notify":
