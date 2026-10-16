@@ -149,6 +149,20 @@ def _screens(prefix):
             for m in re.finditer(r"^\s*(\d+\.%s(\S+))\s" % re.escape(prefix), out, re.M)}
 
 
+_GLYPHS = {"\x14": "—", "\x19": "'", "\x18": "'", "\x1c": '"', "\x1d": '"'}
+
+
+def _tidy(text):
+    """Screen text for people: hardcopy turns box rules into "LLLL…" and some punctuation into control bytes."""
+    out = []
+    for line in text.splitlines():
+        line = "".join(_GLYPHS.get(c, "" if ord(c) < 32 and c != "\t" else c) for c in line).rstrip()
+        if len(line) >= 20 and len(set(line.strip())) == 1:
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
+
+
 def _screen_text(session):
     fd, path = tempfile.mkstemp(prefix="stairway-")
     os.close(fd)
@@ -481,7 +495,7 @@ def answer_permission(name, allow):
         raise ValueError("%s is not running" % name)
     _stuff(session, "\r" if allow else "\033")
     time.sleep(2)
-    return _tail(_screen_text(session), 12)
+    return _tail(_tidy(_screen_text(session)), 12)
 
 
 def experiment_info(name):
@@ -1534,7 +1548,7 @@ def handle_hook(name, kind, payload):
         if not idle:
             # What it wants to do: the permission prompt on its screen, else the hook's message.
             session = _screens(RC_PREFIX).get(name)
-            shown = _tail(_screen_text(session), 25) if session else ""
+            shown = _tail(_tidy(_screen_text(session)), 25) if session else ""
             threading.Thread(target=_callback_post, args=(name, entry, shown or msg, "waiting"), daemon=True).start()
     if not TG_TOKEN or not _tg_bound(name):
         return {"ok": bool(entry.get("callback")), "error": None if entry.get("callback") else "no Telegram chat is bound to %s" % name}
