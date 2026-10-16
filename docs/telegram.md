@@ -18,7 +18,7 @@ messages, which is all stairway needs.
 
 | in the group | what happens |
 |---|---|
-| `/new <name> [claude\|opencode\|crush] [brief]` | creates a session-mode experiment (Claude Code unless you name another agent), binds it to this chat, and starts it on the brief |
+| `/new <name> [claude\|opencode\|crush\|openclaude] [brief]` | creates a session-mode experiment (Claude Code unless you name another agent), binds it to this chat, and starts it on the brief |
 | `/bind <name>` / `/unbind` | binds or unbinds an existing session-mode experiment; `/status` can do this too |
 | `@bot …`, a reply to the bot, or `/ask …` | typed into the session as `[Telegram, <sender> in <group>] …`. If you reply to someone else's message, the quoted text goes along |
 | a document or photo with a mention, or as a reply to the bot | saved to `telegram-uploads/` in the experiment, and Claude is told the path |
@@ -40,10 +40,10 @@ file edits happen on their own, and shell commands ask for approval.
 ## Notes
 
 - Only session-mode experiments can be bound, because server mode has no single session to type into.
-- Replies are read from the agent's own conversation store, so they're relayed for Claude Code, opencode and
-  crush alike, including sessions that were already running before you bound the chat.
-- Permission-request notices need a Claude Code session started by stairway 0.2 or later (it has the
-  `Notification` hook).
+- Replies are read from the agent's own conversation store, so they're relayed for Claude Code, opencode,
+  crush and openclaude alike, including sessions that were already running before you bound the chat.
+- Permission-request notices need a Claude Code or openclaude session started by stairway 0.2 or later (it has
+  the `Notification` hook).
 - When a group becomes a supergroup, its chat id changes. stairway moves the binding automatically.
 - Telegram limits bots to sending files of at most 50 MB, and stairway posts long replies in 4,000-character
   pieces.

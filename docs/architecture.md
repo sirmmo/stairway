@@ -78,12 +78,13 @@ Telegram chat, it reads newly finished answers from the agent's own conversation
 | claude | the newest `~/.claude/projects/<folder, with non-alphanumerics as ->/*.jsonl` | `assistant` entries with `stop_reason: end_turn`, posted once the file has been quiet for one poll |
 | opencode | `~/.local/share/opencode/opencode.db` (sessions matched on `directory`) | an assistant message with `time.completed` that isn't a tool-call step; errors are posted as warnings |
 | crush | `<folder>/.crush/crush.db` | an assistant message with `finished_at` whose finish reason isn't `tool_use`; errors are posted as warnings |
+| openclaude | `state/agents/<name>/openclaude/projects/<folder, as for claude>/*.jsonl` | the same as claude: it writes Claude Code's transcript format |
 
 On first sight of an experiment the watcher starts at the end, so history isn't replayed. A new Claude
 transcript, meaning a restarted session, is read from its start. Because nothing depends on hooks, this works
 for sessions started before the chat was bound.
 
-## Other agents (opencode, crush)
+## Other agents (opencode, crush, openclaude)
 
 `agent=opencode` or `agent=crush` replaces Claude Code in the experiment's screen. stairway writes a
 per-experiment config to `state/agents/<name>/`, which points the agent at `STAIRWAY_PROVIDER_BASE_URL` with
@@ -96,6 +97,14 @@ the chosen model:
 - **crush:** `CRUSH_GLOBAL_CONFIG` and `CRUSH_GLOBAL_DATA` point into `state/agents/<name>/`, with an
   `openai-compat` provider. crush has no prompt flag, so stairway types the first prompt in once the UI is up.
   `acceptEdits` pre-allows the file tools, and `auto`, `dontAsk` and `bypassPermissions` become `--yolo`.
+- **openclaude** is a Claude Code fork, so it runs like a Claude session, with the same `--settings` (theme and
+  `Notification` hook), `--append-system-prompt` and permission modes, but no remote control.
+  `OPENCLAUDE_CONFIG_DIR=state/agents/<name>/openclaude` keeps its config, history and transcripts per
+  experiment. stairway pre-sets the theme, marks onboarding as done and trusts the folder there, so no first-run
+  dialogs appear. The provider goes in through `CLAUDE_CODE_USE_OPENAI=1`, `OPENAI_BASE_URL`, `OPENAI_API_KEY` and
+  `OPENAI_MODEL`. openclaude needs Node 22 or later; stairway puts the binary's folder first on `PATH`, so a
+  `node` installed next to it wins. On glibc older than 2.28, use an
+  [unofficial `glibc-217` Node build](https://unofficial-builds.nodejs.org/download/release/).
 - **opencode always draws in 24-bit color**, so it runs through `stairway.py tty256`. That small
   pseudo-terminal filter rewrites `ESC[38;2;r;g;bm` codes to the nearest xterm-256 color, because screen 4.x
   can't render 24-bit color. crush already respects `TERM=screen-256color`.

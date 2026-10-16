@@ -24,10 +24,11 @@ Config (env):
   STAIRWAY_CLAUDE_THEME Claude theme for sessions; must be an ANSI one for screen (default: dark-ansi)
   STAIRWAY_TELEGRAM_TOKEN  optional Telegram bot token: chats approved on /status can drive session experiments
   STAIRWAY_TELEGRAM_PERMISSION_MODE  permission mode for experiments made with /new (default: acceptEdits)
-  STAIRWAY_PROVIDER_BASE_URL  OpenAI-compatible API for opencode/crush (default: https://openrouter.ai/api/v1)
+  STAIRWAY_PROVIDER_BASE_URL  OpenAI-compatible API for opencode/crush/openclaude (default: https://openrouter.ai/api/v1)
   STAIRWAY_PROVIDER_API_KEY   its API key (OPENROUTER_API_KEY also works)
-  STAIRWAY_PROVIDER_MODEL     default model for opencode/crush (default: deepseek/deepseek-v4.1-flash)
-  STAIRWAY_OPENCODE / STAIRWAY_CRUSH  agent binaries (default: on PATH, or ~/.opencode/bin/opencode)
+  STAIRWAY_PROVIDER_MODEL     default model for the other agents (default: deepseek/deepseek-v4.1-flash)
+  STAIRWAY_OPENCODE / STAIRWAY_CRUSH / STAIRWAY_OPENCLAUDE  agent binaries (default: on PATH, or
+                        ~/.opencode/bin/opencode, or the newest ~/.local/lib/node-*/bin/openclaude)
   STAIRWAY_CODE_SERVER  code-server binary (default: newest ~/.local/lib/code-server-*/bin/code-server,
                         else code-server on PATH)
 """
@@ -71,6 +72,9 @@ CLAUDE_THEME = os.environ.get("STAIRWAY_CLAUDE_THEME", "dark-ansi")
 OPENCODE = (os.environ.get("STAIRWAY_OPENCODE") or shutil.which("opencode")
             or next((p for p in [os.path.expanduser("~/.opencode/bin/opencode")] if os.path.exists(p)), None))
 CRUSH = os.environ.get("STAIRWAY_CRUSH") or shutil.which("crush")
+# openclaude (a Claude Code fork for OpenAI-compatible APIs) needs Node 22+: its bin folder goes first on PATH
+OPENCLAUDE = (os.environ.get("STAIRWAY_OPENCLAUDE") or shutil.which("openclaude")
+              or (sorted(glob.glob(os.path.expanduser("~/.local/lib/node-*/bin/openclaude"))) or [None])[-1])
 PROVIDER_BASE_URL = os.environ.get("STAIRWAY_PROVIDER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 PROVIDER_API_KEY = os.environ.get("STAIRWAY_PROVIDER_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
 PROVIDER_MODEL = os.environ.get("STAIRWAY_PROVIDER_MODEL", "deepseek/deepseek-v4.1-flash")
@@ -78,13 +82,13 @@ CODE_SERVER = (os.environ.get("STAIRWAY_CODE_SERVER")
                or (sorted(glob.glob(os.path.expanduser("~/.local/lib/code-server-*/bin/code-server"))) or [None])[-1]
                or shutil.which("code-server"))
 
-SERVER_INFO = {"name": "stairway", "version": "0.3.0"}
+SERVER_INFO = {"name": "stairway", "version": "0.4.0"}
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 PERMISSION_MODES = ["default", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"]
 SPAWN_MODES = ["same-dir", "worktree", "session"]
 RUN_MODES = ["session", "server"]
-AGENTS = ["claude", "opencode", "crush"]
+AGENTS = ["claude", "opencode", "crush", "openclaude"]
 URL_RE = re.compile(r"https://claude\.ai/code[^\s'\")\]]*")
 MAX_PROMPT = 100000
 RC_PREFIX = "stairway."
@@ -294,6 +298,27 @@ def _agent_command(agent, name, path, permission_mode, model, prompt):
             json.dump(config, f, indent=2)
         env.update(CRUSH_GLOBAL_CONFIG=os.path.join(d, "crush-config"), CRUSH_GLOBAL_DATA=os.path.join(d, "crush-data"))
         return [CRUSH, "--cwd", path] + (["--yolo"] if trusting else []), env, prompt  # no prompt flag: type it
+    if agent == "openclaude":
+        if not OPENCLAUDE:
+            raise ValueError("openclaude is not installed; set STAIRWAY_OPENCLAUDE")
+        home = os.path.join(d, "openclaude")
+        os.makedirs(home, exist_ok=True)
+        # its own config home: no first-run theme picker, and the folder is trusted (stairway created or you approved it)
+        cfg = os.path.join(home, ".openclaude.json")
+        try:
+            with open(cfg) as f:
+                config = json.load(f)
+        except (OSError, ValueError):
+            config = {}
+        config.update(hasCompletedOnboarding=True, theme=CLAUDE_THEME)
+        config.setdefault("projects", {}).setdefault(path, {})["hasTrustDialogAccepted"] = True
+        with open(cfg, "w") as f:
+            json.dump(config, f, indent=2)
+        env.update(OPENCLAUDE_CONFIG_DIR=home, CLAUDE_CODE_USE_OPENAI="1", OPENAI_API_KEY=PROVIDER_API_KEY,
+                   OPENAI_BASE_URL=PROVIDER_BASE_URL, OPENAI_MODEL=model, DISABLE_AUTOUPDATER="1",
+                   PATH=os.path.dirname(OPENCLAUDE) + os.pathsep + os.environ.get("PATH", ""))
+        return ([OPENCLAUDE, "--permission-mode", permission_mode, "--settings", json.dumps(_session_settings(name)),
+                 "--append-system-prompt", _session_system_prompt(name)] + ([prompt] if prompt else [])), env, None
     raise ValueError("agent must be one of %s" % AGENTS)
 
 
@@ -391,7 +416,7 @@ def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=N
         if mode == "server" and "Connected" in text:
             break
         settled += 1 if text.strip() else 0
-        if mode == "session" and (url or settled >= (8 if agent == "claude" else 5)):
+        if mode == "session" and (url or settled >= (8 if agent in ("claude", "openclaude") else 5)):
             break
     if to_type and name in _screens(RC_PREFIX):
         _type_prompt(_screens(RC_PREFIX)[name], to_type)
@@ -803,10 +828,10 @@ PROMPT = {"type": "string",
                          "conversation, e.g. goal, constraints, first steps. It starts working on it right away."}
 AGENT = {"type": "string", "enum": AGENTS, "default": "claude",
          "description": "Coding agent to run: claude (Claude Code, the default, with remote control), or opencode / "
-                        "crush using the server's OpenAI-compatible provider (%s). Non-Claude agents run in session "
-                        "mode and have no claude.ai/code link." % PROVIDER_BASE_URL}
+                        "crush / openclaude (a Claude Code fork) using the server's OpenAI-compatible provider (%s). "
+                        "Non-Claude agents run in session mode and have no claude.ai/code link." % PROVIDER_BASE_URL}
 MODEL = {"type": "string",
-         "description": "Model for opencode/crush, as the provider names it (default %s)." % PROVIDER_MODEL}
+         "description": "Model for opencode/crush/openclaude, as the provider names it (default %s)." % PROVIDER_MODEL}
 NAME_ONLY = {"type": "object", "required": ["name"], "properties": {"name": NAME}}
 READ_ONLY = {"readOnlyHint": True, "openWorldHint": False}
 
@@ -1062,7 +1087,7 @@ def _connect_section(base):
 
 
 def _new_section():
-    modes = ("<label>Agent%s</label><label>Model (opencode/crush)<input name=\"model\" placeholder=\"%s\"></label>"
+    modes = ("<label>Agent%s</label><label>Model (other agents)<input name=\"model\" placeholder=\"%s\"></label>"
              "<label>Run mode (Claude)%s</label><label>Permission mode%s</label><label>Spawn (server mode)%s</label>"
              "<label>First prompt (session mode, optional)<textarea name=\"prompt\" rows=\"4\" "
              "placeholder=\"What should Claude do first?\"></textarea></label>") % (
@@ -1240,7 +1265,7 @@ PHOTO_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 _tg_me = {}
 TG_COMMANDS = [
     ("ask", "Send a message to the experiment's Claude"),
-    ("new", "<name> [claude|opencode|crush] [brief]: create an experiment and bind it here"),
+    ("new", "<name> [claude|opencode|crush|openclaude] [brief]: create an experiment and bind it here"),
     ("bind", "<name>: bind an existing session-mode experiment here"),
     ("unbind", "Unbind the experiment from this chat"),
     ("status", "Experiment state and links"),
@@ -1410,9 +1435,9 @@ def _ro_db(path):
     return sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
 
 
-def _claude_replies(name, path, st):
+def _claude_replies(name, path, st, home="~/.claude"):
     """New final answers in the newest Claude Code transcript of this folder."""
-    proj = os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", path))
+    proj = os.path.join(os.path.expanduser(home), "projects", re.sub(r"[^A-Za-z0-9]", "-", path))
     try:
         files = sorted((os.path.getmtime(os.path.join(proj, f)), f) for f in os.listdir(proj) if f.endswith(".jsonl"))
     except FileNotFoundError:
@@ -1514,7 +1539,12 @@ def _crush_replies(name, path, st):
         db.close()
 
 
-REPLY_READERS = {"claude": _claude_replies, "opencode": _opencode_replies, "crush": _crush_replies}
+def _openclaude_replies(name, path, st):
+    return _claude_replies(name, path, st, os.path.join(_agent_dir(name), "openclaude"))
+
+
+REPLY_READERS = {"claude": _claude_replies, "opencode": _opencode_replies, "crush": _crush_replies,
+                 "openclaude": _openclaude_replies}
 
 
 def _relay_loop():
@@ -1638,7 +1668,7 @@ def _tg_command(cid, chat, msg, cmd, arg):
         if first.lower() in AGENTS:
             agent, brief = first.lower(), rest
         if not new:
-            return _tg_say(cid, "Usage: /new <name> [claude|opencode|crush] [brief]")
+            return _tg_say(cid, "Usage: /new <name> [claude|opencode|crush|openclaude] [brief]")
         _tg_say(cid, "Creating %s…" % new)
         prompt = ("[Telegram, %s in %s]\n%s" % (_tg_sender(msg), chat.get("title") or "a private chat", brief.strip())
                   if brief.strip() else None)
