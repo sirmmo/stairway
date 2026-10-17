@@ -121,7 +121,18 @@ Put it behind HTTPS (see [docs/deployment.md](docs/deployment.md)). Then:
 | `answer_permission(name, allow)` | answer the permission question a session is waiting on (Yes or No) |
 | `experiment_files(name, path?, max_mb?)` | the folder (or a subfolder such as `deliverables`) as a base64 zip in JSON; `.git` and dependency folders are left out |
 | `open_editor(name)` / `stop_editor(name)` | the experiment's browser VS Code |
+| `answer_permission(name, allow)` | answer the Yes/No permission question a session is waiting on |
+| `experiment_info(name)` / `experiment_files(name, path?)` | state as JSON; the folder's files as a base64 zip (for programs) |
 | `forget_experiment(name)` | remove it from stairway; the folder is never deleted |
+
+### A skill for the agent
+
+[`skills/stairway/SKILL.md`](skills/stairway/SKILL.md) teaches an agent how to use these tools well: how to
+write a standalone brief, when to pick each agent, mode and permission mode, how to follow progress, and to
+check with you before answering permission questions.
+
+- **claude.ai:** zip the `skills/stairway` folder and upload it in **Settings → Capabilities → Skills**.
+- **Claude Code:** `cp -r skills/stairway ~/.claude/skills/` (or into a project's `.claude/skills/`).
 
 ## Callbacks for programs
 
