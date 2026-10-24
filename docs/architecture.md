@@ -10,7 +10,9 @@ detached GNU `screen` sessions, so restarting stairway doesn't interrupt running
 | `stairway.<name>` | `claude --remote-control <name> …` (session mode) or `claude remote-control …` (server mode) | `create_experiment`, `start_experiment`, an approval, Telegram `/new` and `/start` |
 | `stairway-code.<name>` | `code-server --socket state/code/<name>/code.sock …` | the first visit to `/code/<name>/`, or `open_editor` |
 
-To look at a session from a shell, run `screen -x stairway.<name>`; press Ctrl-a d to detach.
+To look at a session from a shell, run `screen -x stairway.<name>`; press Ctrl-a d to detach. With the herdr
+runtime (below), each experiment is instead a herdr workspace labelled `stairway.<name>` in the herdr session
+`stairway`: run `herdr --session stairway` to see them all, or `herdr --session stairway agent attach <pane>`.
 
 stairway answers Claude Code's one-time folder-trust question for registered folders. It handles both the
 `[y/N]` prompt of `claude remote-control` and the menu of interactive sessions. A folder is registered only if
@@ -110,6 +112,39 @@ the chosen model:
   can't render 24-bit color. crush already respects `TERM=screen-256color`.
 - **Agent processes get the provider key, but not stairway's own secrets** (`STAIRWAY_TOKEN` and the
   Telegram token). Claude sessions don't get the provider key either.
+
+## The herdr runtime
+
+`STAIRWAY_RUNTIME=herdr` runs agents in [herdr](https://herdr.dev), a terminal multiplexer that recognizes
+coding agents and tracks their state (`working`, `blocked`, `done`, `idle`). stairway still talks to it only
+through its CLI, so stairway itself stays dependency-free.
+
+- **One headless server** in a named session (`STAIRWAY_HERDR_SESSION`, default `stairway`), started by
+  stairway when needed. Like screen, it outlives stairway restarts.
+- **One workspace per experiment**, labelled `stairway.<name>`. Its root pane runs
+  `exec state/agents/<name>/run.sh`: a launcher (mode 700) that sets the agent's environment and `exec`s it. API
+  keys therefore never appear in typed input or shell history. When the agent exits, its workspace closes.
+- **Handles:** internally a running experiment is a screen session id or `herdr:<pane id>`. Reading the
+  screen (`pane read --source visible`), typing prompts (`agent prompt`, which pastes the way each agent
+  expects), sending keys and stopping (`workspace close`) go to whichever runtime started it. You can switch
+  `STAIRWAY_RUNTIME` at any time, and experiments already running under the other runtime keep working.
+- **States:** one `herdr api snapshot` per poll gives every pane and its agent state. The status page shows it
+  as a chip.
+  - opencode and crush have no `Notification` hook, so when herdr sees them turn `blocked`, stairway posts the
+    "waiting" event to callbacks and Telegram itself. Claude Code and openclaude keep using their hook.
+- **`send_prompt(…, wait_seconds=N)`** uses `agent prompt --wait`, which returns once the agent is idle,
+  done or blocked, and then returns the terminal. If the agent is blocked, prompts are refused until the
+  question is answered, instead of being typed into the dialog.
+- **Agent hints:** openclaude runs with `HERDR_AGENT=claude`, because it draws Claude Code's UI. opencode runs
+  with `HERDR_AGENT=opencode`, because it still runs inside `tty256`: opencode 1.4 draws nothing until it gets a
+  fresh terminal and a first resize, which `tty256` provides.
+- **Claude Code's renderer:** Claude Code picks its fullscreen renderer for herdr's terminal (libghostty), and
+  that renderer hangs in a pane with no client attached. Sessions under herdr therefore get `"tui": "default"`
+  in `--settings`.
+- **VS Code:** the "auto" terminal runs `herdr agent attach <pane>` (Ctrl-b q detaches) if no other terminal is
+  attached; otherwise it opens a shell.
+- herdr fetches updated agent-detection rules from herdr.dev. Set `[update] manifest_check = false` in
+  `~/.config/herdr/config.toml` if you don't want that.
 
 ## VS Code terminals
 

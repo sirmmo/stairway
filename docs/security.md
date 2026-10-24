@@ -30,6 +30,10 @@ refresh tokens, and hook keys. Running sessions keep their old hook keys until y
   token on `/mcp/<x>` gets a 404. OAuth requires PKCE (S256), exact redirect URI matching, and HTTPS
   redirect URIs (or localhost).
 - **Logs redact** path tokens and hook keys.
+- **Agent secrets stay out of typed input.** With the herdr runtime, the provider key reaches the agent through
+  `state/agents/<name>/run.sh` (mode 700, inside the 700 `state/` folder), never through text typed into a
+  pane. herdr's socket lives in `~/.config/herdr/sessions/<session>/`: anyone who can use it can drive the
+  agents, just like attaching to their screen sessions.
 
 ## Recommendations
 

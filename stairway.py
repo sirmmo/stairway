@@ -29,6 +29,8 @@ Config (env):
   STAIRWAY_PROVIDER_MODEL     default model for the other agents (default: deepseek/deepseek-v4.1-flash)
   STAIRWAY_OPENCODE / STAIRWAY_CRUSH / STAIRWAY_OPENCLAUDE  agent binaries (default: on PATH, or
                         ~/.opencode/bin/opencode, or the newest ~/.local/lib/node-*/bin/openclaude)
+  STAIRWAY_RUNTIME      where agents run: screen (default) or herdr (https://herdr.dev: agent states for
+                        every agent, prompt-and-wait); STAIRWAY_HERDR / STAIRWAY_HERDR_SESSION (default: stairway)
   STAIRWAY_CODE_SERVER  code-server binary (default: newest ~/.local/lib/code-server-*/bin/code-server,
                         else code-server on PATH)
 """
@@ -41,6 +43,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import select
 import shutil
 import socket
@@ -78,11 +81,15 @@ OPENCLAUDE = (os.environ.get("STAIRWAY_OPENCLAUDE") or shutil.which("openclaude"
 PROVIDER_BASE_URL = os.environ.get("STAIRWAY_PROVIDER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 PROVIDER_API_KEY = os.environ.get("STAIRWAY_PROVIDER_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
 PROVIDER_MODEL = os.environ.get("STAIRWAY_PROVIDER_MODEL", "deepseek/deepseek-v4.1-flash")
+RUNTIME = os.environ.get("STAIRWAY_RUNTIME", "screen")
+HERDR = os.environ.get("STAIRWAY_HERDR") or shutil.which("herdr") or next(
+    (p for p in [os.path.expanduser("~/.local/bin/herdr")] if os.path.exists(p)), None)
+HERDR_SESSION = os.environ.get("STAIRWAY_HERDR_SESSION", "stairway")
 CODE_SERVER = (os.environ.get("STAIRWAY_CODE_SERVER")
                or (sorted(glob.glob(os.path.expanduser("~/.local/lib/code-server-*/bin/code-server"))) or [None])[-1]
                or shutil.which("code-server"))
 
-SERVER_INFO = {"name": "stairway", "version": "0.4.0"}
+SERVER_INFO = {"name": "stairway", "version": "0.5.0"}
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 PERMISSION_MODES = ["default", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"]
@@ -168,6 +175,11 @@ def _tidy(text):
 
 
 def _screen_text(session):
+    if session.startswith("herdr:"):
+        # the visible screen: agents draw on the alternate screen, which never reaches scrollback
+        text = _herdr_cli("pane", "read", session[6:], "--source", "visible", raw=True)
+        lines = [l.rstrip() for l in text.splitlines()]
+        return "\n".join(l for i, l in enumerate(lines) if l or (i and lines[i - 1]))[-4000:].strip()
     fd, path = tempfile.mkstemp(prefix="stairway-")
     os.close(fd)
     try:
@@ -186,7 +198,100 @@ def _session_url(text):
 
 
 def _quit(session):
+    if session.startswith("herdr:"):
+        _herdr_cli("workspace", "close", session[6:].split(":")[0])
+        return
     subprocess.run(["screen", "-S", session, "-X", "quit"])
+
+
+def _sessions():
+    """Map name -> handle of every running experiment, whichever runtime it was started in."""
+    found = _screens(RC_PREFIX)
+    found.update(_herdr_panes())
+    return found
+
+
+# ---------------------------------------------------------------- herdr runtime (STAIRWAY_RUNTIME=herdr)
+
+_herdr_status = {}  # name -> agent state herdr last reported (idle, working, blocked, done, unknown)
+
+
+def _herdr_cli(*args, raw=False, timeout=30):
+    """Run a herdr command against stairway's own session; its JSON result, or the raw output."""
+    res = subprocess.run([HERDR, "--session", HERDR_SESSION] + list(args), stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout, env=_child_env())
+    if res.returncode:
+        try:
+            err = json.loads(res.stderr)["error"]
+            msg = "%s: %s" % (err.get("code"), err.get("message"))
+        except (ValueError, KeyError, TypeError):
+            msg = res.stderr.strip() or "exit status %d" % res.returncode
+        raise ValueError("herdr %s failed: %s" % (" ".join(args[:2]), msg))
+    return res.stdout if raw else (json.loads(res.stdout).get("result", {}) if res.stdout.strip() else {})
+
+
+def _herdr_socket():
+    return os.path.expanduser("~/.config/herdr/sessions/%s/herdr.sock" % HERDR_SESSION)
+
+
+def _herdr_panes():
+    """name -> "herdr:<pane>" for experiments running in herdr (one workspace each, labelled stairway.<name>)."""
+    if not HERDR or not _socket_alive(_herdr_socket()):
+        return {}
+    try:
+        snap = _herdr_cli("api", "snapshot", timeout=10)["snapshot"]
+    except Exception as e:
+        sys.stderr.write("stairway: herdr snapshot: %s\n" % e)
+        return {}
+    labels = {w["workspace_id"]: w.get("label", "")[len(RC_PREFIX):] for w in snap.get("workspaces") or []
+              if w.get("label", "").startswith(RC_PREFIX)}
+    out = {}
+    for pane in snap.get("panes") or []:
+        name = labels.get(pane.get("workspace_id"))
+        if name and name not in out:
+            out[name] = "herdr:" + pane["pane_id"]
+            _herdr_status[name] = pane.get("agent_status") if pane.get("agent") else None
+    return out
+
+
+def _herdr_server():
+    """Start stairway's headless herdr server unless it is up. It outlives stairway, like screen does."""
+    if not HERDR:
+        raise ValueError("STAIRWAY_RUNTIME=herdr, but herdr is not installed; set STAIRWAY_HERDR")
+    if _socket_alive(_herdr_socket()):
+        return
+    subprocess.Popen([HERDR, "--session", HERDR_SESSION, "server"], env=_child_env(), cwd=STATE,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        time.sleep(0.3)
+        if _socket_alive(_herdr_socket()):
+            return
+    raise ValueError("the herdr server did not come up within 15s")
+
+
+def _herdr_start(name, path, cmd, extra_env, agent):
+    """Run cmd in a new herdr workspace. A private launcher script carries the environment, so secrets never
+    appear in typed input or shell history; the workspace closes when the agent exits."""
+    _herdr_server()
+    # herdr can't see the agent behind a wrapper (opencode runs inside tty256, whose fresh terminal and
+    # initial resize opencode 1.4 also needs to draw at all) or know that openclaude looks like Claude Code
+    hint = {"openclaude": "claude", "opencode": "opencode"}.get(agent)
+    if hint:
+        extra_env = dict(extra_env, HERDR_AGENT=hint)
+    os.makedirs(_agent_dir(name), exist_ok=True)
+    script = os.path.join(_agent_dir(name), "run.sh")
+    fd = os.open(script, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
+    with os.fdopen(fd, "w") as f:
+        f.write("#!/bin/sh\n# written by stairway for %s\ncd %s || exit 1\n" % (name, shlex.quote(path)))
+        f.write("".join("export %s=%s\n" % (k, shlex.quote(v)) for k, v in sorted(extra_env.items())))
+        f.write("exec %s\n" % " ".join(shlex.quote(c) for c in cmd))
+    os.chmod(script, 0o700)
+    ws = _herdr_cli("workspace", "create", "--cwd", path, "--label", RC_PREFIX + name, "--no-focus")
+    pane = ws["root_pane"]["pane_id"]
+    _herdr_cli("pane", "run", pane, "exec " + shlex.quote(script))
+    return pane
 
 
 # ---------------------------------------------------------------- remote-control instances
@@ -322,7 +427,17 @@ def _agent_command(agent, name, path, permission_mode, model, prompt):
     raise ValueError("agent must be one of %s" % AGENTS)
 
 
+_HERDR_KEYS = {"\r": "enter", "\033": "esc", "\033[B": "down", "\033[A": "up"}
+
+
 def _stuff(session, keys):
+    if session.startswith("herdr:"):
+        for part in re.findall(r"\033\[[AB]|\033|\r|[^\033\r]+", keys):
+            if part in _HERDR_KEYS:
+                _herdr_cli("pane", "send-keys", session[6:], _HERDR_KEYS[part])
+            else:
+                _herdr_cli("pane", "send-text", session[6:], part)
+        return
     subprocess.run(["screen", "-S", session, "-X", "stuff", keys], check=True)
 
 
@@ -345,6 +460,16 @@ def _answer_trust(session, text):
 
 def _type_prompt(session, prompt):
     """Type a prompt into an interactive session as one bracketed paste, then press Enter."""
+    if session.startswith("herdr:"):
+        try:
+            _herdr_cli("agent", "prompt", session[6:], prompt)  # herdr pastes it the way the agent expects
+        except ValueError as e:
+            if "agent_blocked" in str(e):
+                raise ValueError("it is waiting on a permission question: answer it first (answer_permission)")
+            _herdr_cli("pane", "send-text", session[6:], "\033[200~" + prompt + "\033[201~")
+            time.sleep(0.7)
+            _herdr_cli("pane", "send-keys", session[6:], "enter")
+        return
     fd, path = tempfile.mkstemp(prefix="stairway-prompt-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -380,12 +505,12 @@ def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=N
     _check_run(mode, prompt)
     if mode == "server" and spawn == "worktree" and not os.path.isdir(os.path.join(path, ".git")):
         raise ValueError("spawn=worktree needs a git repository in the experiment folder")
-    if name in _screens(RC_PREFIX):
+    if name in _sessions():
         hint = " Use send_prompt to give it instructions." if prompt and mode == "session" else ""
         return "Experiment %r is already running.%s" % (name, hint)
     _update(name, permission_mode=permission_mode, spawn=spawn, mode=mode, initial_prompt=None, agent=agent,
             model=model if agent != "claude" else None)
-    env, to_type = _child_env(), None
+    env, to_type, extra = _child_env(), None, {}
     if agent != "claude":
         cmd, extra, to_type = _agent_command(agent, name, path, permission_mode, model, prompt)
         env.update(extra)
@@ -395,7 +520,11 @@ def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=N
                "--append-system-prompt", _session_system_prompt(name)] + ([prompt] if prompt else [])
     else:
         cmd = [CLAUDE, "remote-control", "--name", name, "--permission-mode", permission_mode, "--spawn", spawn]
-    subprocess.run(["screen", "-U", "-T", "screen-256color", "-dmS", RC_PREFIX + name] + cmd, cwd=path, env=env, check=True)
+    if RUNTIME == "herdr":
+        _herdr_start(name, path, cmd, extra if agent != "claude" else {}, agent)
+    else:
+        subprocess.run(["screen", "-U", "-T", "screen-256color", "-dmS", RC_PREFIX + name] + cmd, cwd=path, env=env,
+                       check=True)
     if prompt:
         _log_prompt(name, "start", prompt)
 
@@ -403,7 +532,10 @@ def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=N
     deadline = time.time() + 40
     while time.time() < deadline:
         time.sleep(1)
-        session = _screens(RC_PREFIX).get(name)
+        session = _sessions().get(name)
+        if not session and RUNTIME == "herdr":
+            time.sleep(1)  # look twice: a busy herdr server can miss one snapshot
+            session = _sessions().get(name)
         if not session:
             return "%s for %r exited right away. Last output:\n\n%s" % (agent, name, text)
         text = _screen_text(session)
@@ -418,10 +550,10 @@ def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=N
         settled += 1 if text.strip() else 0
         if mode == "session" and (url or settled >= (8 if agent in ("claude", "openclaude") else 5)):
             break
-    if to_type and name in _screens(RC_PREFIX):
-        _type_prompt(_screens(RC_PREFIX)[name], to_type)
+    if to_type and name in _sessions():
+        _type_prompt(_sessions()[name], to_type)
         time.sleep(2)
-        text = _screen_text(_screens(RC_PREFIX)[name])
+        text = _screen_text(_sessions()[name])
     if agent != "claude":
         what = "%s with %s via %s%s" % (agent, model, urlsplit(PROVIDER_BASE_URL).hostname,
                                         ", working on the prompt" if prompt else "")
@@ -433,20 +565,38 @@ def start_experiment(name, permission_mode=None, spawn=None, mode=None, prompt=N
             % (what, name, path, permission_mode, " claude.ai/code: %s." % url if url else "", _tail(text)))
 
 
-def send_prompt(name, prompt):
+def send_prompt(name, prompt, wait_seconds=0):
     entry = _get(name)
     _check_prompt(prompt)
+    wait_seconds = max(0, min(int(wait_seconds or 0), 600))
     if entry.get("mode", "server") != "session":
         raise ValueError("%r runs in server mode, which has no terminal session to type into; stop it and use "
                          "start_experiment(name, mode='session', prompt=...)" % name)
-    session = _screens(RC_PREFIX).get(name)
+    session = _sessions().get(name)
     if not session:
         raise ValueError("%r is not running; use start_experiment(name, prompt=...) to start it with this prompt"
                          % name)
+    if wait_seconds and session.startswith("herdr:"):
+        # submit and wait in one request: herdr returns once the agent is idle, done or blocked again
+        try:
+            res = _herdr_cli("agent", "prompt", session[6:], prompt, "--wait", "--timeout", str(wait_seconds * 1000),
+                             timeout=wait_seconds + 15)
+            state = res.get("agent", {}).get("agent_status")
+        except ValueError as e:
+            if "agent_blocked" in str(e):
+                raise ValueError("%r is waiting on a permission question: answer it first (answer_permission)" % name)
+            if "timeout" not in str(e) and "stalled" not in str(e):
+                raise
+            state = "still working after %ds" % wait_seconds
+        _log_prompt(name, "send", prompt)
+        hint = {"blocked": " It is waiting on a permission question (answer_permission)."}.get(state, "")
+        return "Sent the prompt to %r; it is now %s.%s Its terminal:\n\n%s" % (
+            name, state, hint, _tail(_tidy(_screen_text(session)), 40))
     _type_prompt(session, prompt)
     _log_prompt(name, "send", prompt)
     time.sleep(2)
-    return "Sent the prompt to %r. Current screen:\n\n%s" % (name, _tail(_screen_text(session)))
+    note = (" (wait_seconds needs STAIRWAY_RUNTIME=herdr; it was ignored)" if wait_seconds else "")
+    return "Sent the prompt to %r%s. Current screen:\n\n%s" % (name, note, _tail(_screen_text(session)))
 
 
 def create_experiment(name, permission_mode="default", spawn="same-dir", git_init=True, start=True,
@@ -515,7 +665,7 @@ def _callback_post(name, entry, text, event="reply"):
 def answer_permission(name, allow):
     """Answer the permission question a session is showing: allow = Yes (Enter), otherwise No (Esc)."""
     _get(name, approved=False)
-    session = _screens(RC_PREFIX).get(name)
+    session = _sessions().get(name)
     if not session:
         raise ValueError("%s is not running" % name)
     _stuff(session, "\r" if allow else "\033")
@@ -526,7 +676,7 @@ def answer_permission(name, allow):
 def experiment_info(name):
     """The state of an experiment as JSON, for programs (experiment_status is for people)."""
     entry = _get(name, approved=False)
-    rc = _screens(RC_PREFIX)
+    rc = _sessions()
     return json.dumps({"name": name, "state": _state(name, entry, rc), "running": name in rc,
                        "agent": entry.get("agent", "claude"), "mode": entry.get("mode", "server"),
                        "session_url": entry.get("url"), "folder": entry["path"],
@@ -638,7 +788,7 @@ def _approve(name):
 
 def stop_experiment(name):
     _get(name, approved=False)
-    session = _screens(RC_PREFIX).get(name)
+    session = _sessions().get(name)
     if not session:
         return "Experiment %r is not running." % name
     _quit(session)
@@ -671,7 +821,7 @@ def _state(name, entry, rc):
 
 
 def list_experiments():
-    reg, rc, code = _load(), _screens(RC_PREFIX), _screens(CODE_PREFIX)
+    reg, rc, code = _load(), _sessions(), _screens(CODE_PREFIX)
     if not reg:
         return "No experiments yet. New ones go in %s." % ROOT
     return "\n".join("%s\t%s\t%s\t%s mode\teditor %s\t%s\t%s" % (
@@ -682,7 +832,7 @@ def list_experiments():
 
 def experiment_status(name):
     entry = _get(name, approved=False)
-    rc = _screens(RC_PREFIX)
+    rc = _sessions()
     lines = ["%r: %s, %s, %s mode, %s folder %s" % (name, _state(name, entry, rc), _agent_label(entry),
                                                     entry.get("mode", "server"), entry["origin"], entry["path"])]
     for p in _prompts(name, 3):
@@ -723,10 +873,20 @@ def _socket_alive(path):
 
 TERMINAL_SH = """#!/bin/bash
 # stairway terminal for %(name)s. Default profile ("auto"): in session mode the first terminal joins the
-# Claude session (detach with Ctrl-a d); every other terminal is a shell in the folder.
+# agent session (detach with Ctrl-a d in screen, Ctrl-b q in herdr); every other terminal is a shell in the folder.
 want=$1
 mode=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]].get("mode", "server"))' \\
        %(registry)s %(name)s 2>/dev/null)
+pane=$(%(herdr)s api snapshot 2>/dev/null | python3 -c '
+import json, sys
+snap = json.load(sys.stdin)["result"]["snapshot"]
+ws = [w["workspace_id"] for w in snap["workspaces"] or [] if w.get("label") == sys.argv[1]]
+print(next((p["pane_id"] for p in snap["panes"] or [] if p["workspace_id"] in ws), ""))' %(label)s 2>/dev/null)
+if [ -n "$pane" ] && { [ "$want" = claude ] || { [ "$want" = auto ] && [ "$mode" = session ] &&
+     ! pgrep -f "agent attach $pane" >/dev/null; }; }; then
+  %(herdr)s agent attach "$pane" || echo "Could not attach to herdr pane $pane."
+  exec bash -l
+fi
 s=$(screen -ls | awk '$1 ~ /^[0-9]+\\.%(screen)s$/ && /Detached/ {print $1; exit}')
 [ "$want" = claude ] && s=$(screen -ls | awk '$1 ~ /^[0-9]+\\.%(screen)s$/ {print $1; exit}')
 if [ "$want" = claude ] || { [ "$want" = auto ] && [ "$mode" = session ]; }; then
@@ -745,7 +905,9 @@ def _write_editor_settings(name, data):
     os.makedirs(_editor_dir(name), exist_ok=True)
     script = os.path.join(_editor_dir(name), "terminal.sh")
     with open(script, "w") as f:
-        f.write(TERMINAL_SH % {"name": name, "registry": REGISTRY, "screen": re.escape(RC_PREFIX + name)})
+        f.write(TERMINAL_SH % {"name": name, "registry": REGISTRY, "screen": re.escape(RC_PREFIX + name),
+                               "label": shlex.quote(RC_PREFIX + name),
+                               "herdr": "%s --session %s" % (shlex.quote(HERDR or "herdr"), shlex.quote(HERDR_SESSION))})
     os.chmod(script, 0o755)
     path = os.path.join(data, "User", "settings.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -870,7 +1032,10 @@ TOOLS = {
                        "pass on instructions or context from this conversation. If Claude is busy, the prompt is "
                        "queued. Returns what its terminal shows a moment later.",
         "inputSchema": {"type": "object", "required": ["name", "prompt"], "properties": {
-            "name": NAME, "prompt": {"type": "string", "description": "The text to send (max %d chars)." % MAX_PROMPT}}},
+            "name": NAME, "prompt": {"type": "string", "description": "The text to send (max %d chars)." % MAX_PROMPT},
+            "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 600, "default": 0,
+                             "description": "With the herdr runtime: wait up to this long for the agent to finish "
+                                            "(or ask for permission) and return its terminal then. 0 returns at once."}}},
     }),
     "stop_experiment": (stop_experiment, {
         "description": "Stop the remote-control instance of an experiment. The folder is kept.",
@@ -999,7 +1164,7 @@ margin:8px 0 4px;font-variant-numeric:tabular-nums}.sysbar span+span:before{cont
 .sysbar b{font-weight:500;color:var(--fg)}.meta{font-size:12px;color:var(--muted);margin:-4px 0 8px}
 .sectionhead{display:flex;justify-content:space-between;align-items:baseline}h2 .muted{text-transform:none;letter-spacing:0}
 .chip{font-size:12px;border-radius:99px;padding:1px 9px;background:var(--btn);color:var(--muted)}
-.chip.agent{color:var(--accent)}.chip.ok{color:var(--ok)}.chip.tg{color:var(--fg)}
+.chip.agent{color:var(--accent)}.chip.ok{color:var(--ok)}.chip.tg{color:var(--fg)}.chip.warn{color:var(--warn)}
 .exp .top strong{font-size:16px}.dot{width:9px;height:9px;border-radius:50%;background:var(--off);flex:none}
 .exp.is-running .dot{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 25%,transparent)}
 .card.attention{border-left:3px solid var(--warn)}.card p.muted{margin:4px 0 8px;font-size:13px}
@@ -1125,6 +1290,9 @@ def _experiment_card(n, x, rc, code, chats):
     state = "running" if n in rc else "stopped"
     mode = x.get("mode", "server")
     chips = [_chip(_agent_label(x), "agent")]
+    if state == "running" and rc[n].startswith("herdr:") and _herdr_status.get(n):
+        st = _herdr_status[n]
+        chips.append(_chip({"blocked": "⏳ needs permission"}.get(st, st), "warn" if st == "blocked" else ""))
     if n in code:
         chips.append(_chip("VS Code open", "ok"))
     chips += [_chip("✈ " + t, "tg") for t in chats]
@@ -1158,7 +1326,7 @@ def _experiment_card(n, x, rc, code, chats):
 
 
 def status_page(flash="", base=""):
-    reg, rc, code = _load(), _screens(RC_PREFIX), _screens(CODE_PREFIX)
+    reg, rc, code = _load(), _sessions(), _screens(CODE_PREFIX)
     e = html.escape
     short = {"load (1/5/15 min)": "load", "memory used": "memory", "disk free (experiments root)": "disk free",
              "stairway uptime": "up"}
@@ -1297,7 +1465,10 @@ def _session_settings(name):
     def hook(kind):
         return [{"hooks": [{"type": "command", "timeout": 15,
                             "command": "curl -s -m 10 -X POST --data-binary @- '%s' >/dev/null" % _hook_url(name, kind)}]}]
-    return {"theme": CLAUDE_THEME, "hooks": {"Notification": hook("notify")}}
+    settings = {"theme": CLAUDE_THEME, "hooks": {"Notification": hook("notify")}}
+    if RUNTIME == "herdr":
+        settings["tui"] = "default"  # the fullscreen renderer, chosen for herdr's libghostty, hangs in a headless pane
+    return settings
 
 
 def _session_system_prompt(name):
@@ -1552,7 +1723,7 @@ def _relay_loop():
         time.sleep(3)
         try:
             bound = {c.get("experiment") for c in _tg_load()["chats"].values() if c.get("approved")} if TG_TOKEN else set()
-            reg, running = _load(), _screens(RC_PREFIX)
+            reg, running = _load(), _sessions()
             hooked = {n for n, e in reg.items() if e.get("callback")}
             for name in bound | hooked:
                 entry = reg.get(name)
@@ -1560,6 +1731,12 @@ def _relay_loop():
                     _relay_state.pop(name, None)
                     continue
                 st = _relay_state.setdefault(name, {})
+                # agents without a Notification hook: herdr's screen detection says when they ask for permission
+                state = _herdr_status.get(name) if running[name].startswith("herdr:") else None
+                if state == "blocked" and st.get("herdr") != "blocked" and entry.get("agent") in ("opencode", "crush"):
+                    _notify_waiting(name, entry, "%s needs your permission" % entry["agent"],
+                                    to_chats=name in bound, to_callback=name in hooked)
+                st["herdr"] = state
                 for text in REPLY_READERS[entry.get("agent", "claude")](name, entry["path"], st):
                     if name in bound:
                         _tg_relay(name, text)
@@ -1567,6 +1744,19 @@ def _relay_loop():
                         threading.Thread(target=_callback_post, args=(name, entry, text), daemon=True).start()
         except Exception as e:
             sys.stderr.write("stairway: relay: %s\n" % e)
+
+
+def _notify_waiting(name, entry, msg, to_chats=True, to_callback=True):
+    """It asks for permission: tell bound Telegram chats and the program's callback."""
+    session = _sessions().get(name)
+    shown = _tail(_tidy(_screen_text(session)), 25) if session else ""
+    if to_callback and entry.get("callback"):
+        threading.Thread(target=_callback_post, args=(name, entry, shown or msg, "waiting"), daemon=True).start()
+    if to_chats and TG_TOKEN and _tg_bound(name):
+        text = "⏳ %s: %s" % (name, msg)
+        if "permission" in msg.lower():
+            text += "\n\n%s\n\nAnswer with /approve or /deny (see /screen)." % _tail(shown, 12)
+        threading.Thread(target=_tg_relay, args=(name, text, False), daemon=True).start()
 
 
 def handle_hook(name, kind, payload):
@@ -1577,7 +1767,7 @@ def handle_hook(name, kind, payload):
         idle = payload.get("notification_type") == "idle_prompt" or "waiting for your input" in msg
         if not idle:
             # What it wants to do: the permission prompt on its screen, else the hook's message.
-            session = _screens(RC_PREFIX).get(name)
+            session = _sessions().get(name)
             shown = _tail(_tidy(_screen_text(session)), 25) if session else ""
             threading.Thread(target=_callback_post, args=(name, entry, shown or msg, "waiting"), daemon=True).start()
     if not TG_TOKEN or not _tg_bound(name):
@@ -1690,10 +1880,10 @@ def _tg_command(cid, chat, msg, cmd, arg):
     if cmd == "status":
         return _tg_say(cid, experiment_status(need()).split("\n\nCurrent screen:")[0])
     if cmd == "screen":
-        session = _screens(RC_PREFIX).get(need())
+        session = _sessions().get(need())
         return _tg_say(cid, _tail(_screen_text(session), 30) if session else "%s is not running." % name)
     if cmd in ("approve", "deny"):
-        session = _screens(RC_PREFIX).get(need())
+        session = _sessions().get(need())
         if not session:
             return _tg_say(cid, "%s is not running." % name)
         _stuff(session, "\r" if cmd == "approve" else "\033")
@@ -2311,8 +2501,13 @@ def main():
         sys.exit("Set STAIRWAY_TOKEN to a secret of at least 16 characters.")
     os.makedirs(ROOT, exist_ok=True)
     os.makedirs(STATE, mode=0o700, exist_ok=True)
-    print("stairway: http://%s:%d  (MCP at /mcp/<token>, status at /status), experiments root %s, code-server: %s"
-          % (HOST, PORT, ROOT, CODE_SERVER), file=sys.stderr)
+    if RUNTIME not in ("screen", "herdr"):
+        sys.exit("STAIRWAY_RUNTIME must be screen or herdr.")
+    if RUNTIME == "herdr" and not HERDR:
+        sys.exit("STAIRWAY_RUNTIME=herdr, but herdr is not installed; set STAIRWAY_HERDR.")
+    print("stairway: http://%s:%d  (MCP at /mcp/<token>, status at /status), experiments root %s, runtime %s, "
+          "code-server: %s" % (HOST, PORT, ROOT, RUNTIME if RUNTIME == "screen" else "herdr (%s, session %s)"
+                               % (HERDR, HERDR_SESSION), CODE_SERVER), file=sys.stderr)
     if TG_TOKEN:
         threading.Thread(target=_tg_loop, daemon=True).start()
     # Finished replies go to bound Telegram chats and to experiments' callbacks.

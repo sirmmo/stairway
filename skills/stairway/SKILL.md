@@ -19,7 +19,7 @@ so everything it needs must be in the prompts you send.
 |---|---|
 | `create_experiment(name, prompt?, agent?, model?, mode?, permission_mode?, …)` | make `<root>/<name>`, `git init` it, start the agent working on `prompt` |
 | `attach_folder(path, name?, prompt?, …)` | use an existing folder. Nothing runs until the user approves it on the status page |
-| `send_prompt(name, prompt)` | type a follow-up instruction into a running session (queued if the agent is busy) |
+| `send_prompt(name, prompt, wait_seconds?)` | type a follow-up instruction into a running session (queued if the agent is busy) |
 | `experiment_status(name)` | state, links, recent prompts, and what the agent's terminal shows right now |
 | `list_experiments()` | every experiment: state, agent, mode, editor, folder |
 | `answer_permission(name, allow)` | answer the Yes/No permission question the agent is waiting on |
@@ -65,6 +65,10 @@ prompt. Only folders under the server's allowed roots can be attached.
 - **`send_prompt` returns the screen a moment later, not the answer.** To see progress, call
   `experiment_status(name)` again after a while and read the terminal tail. Don't poll in a tight loop: a
   couple of checks, then tell the user it's working and where to watch it.
+- **If the server uses the herdr runtime**, `send_prompt(name, prompt, wait_seconds=120)` waits until the
+  agent finishes or asks for permission, and returns its terminal and state then. Use it for short tasks
+  whose answer you need right away; keep long work asynchronous. If herdr isn't in use, the result says that
+  `wait_seconds` was ignored.
 - **Long results** are better fetched as files than read off the terminal: ask the agent to write a report
   or deliverables into the folder (e.g. `deliverables/`), then use `experiment_files(name, path="deliverables")`.
 
@@ -72,6 +76,7 @@ prompt. Only folders under the server's allowed roots can be attached.
 
 In `default` or `acceptEdits` mode the agent stops and waits when it wants to run a command (or, in
 `default`, edit a file). `experiment_status` then shows a "Do you want to proceed?" prompt with the action.
+While it's waiting, `send_prompt` may be refused with "waiting on a permission question": answer it first.
 
 - **Tell the user exactly what it wants to do** (the command or edit shown) and ask whether to allow it.
 - Call `answer_permission(name, allow=true)` only after the user agrees, or when they've told you up front to

@@ -44,8 +44,12 @@ More about why it exists: [ingmmo.com/stairway](https://ingmmo.com/stairway/) ·
   [opencode](https://opencode.ai), [crush](https://github.com/charmbracelet/crush) or
   [openclaude](https://github.com/Twigpine/openclaude) instead. They use any OpenAI-compatible provider
   ([OpenRouter](https://openrouter.ai) by default), and you can pick the model per experiment.
-- **Small and dependency-free.** About 1,700 lines of Python 3.8+ with no third-party packages. Claude sessions
-  run inside GNU `screen`, so they survive stairway restarts.
+- **Small and dependency-free.** One file of Python 3.8+ with no third-party packages. Agents run inside GNU
+  `screen`, so they survive stairway restarts.
+- **Optional herdr runtime.** With `STAIRWAY_RUNTIME=herdr`, agents run in [herdr](https://herdr.dev) instead of
+  screen. herdr knows when each agent is working, done or blocked on a permission question, so stairway reports
+  permission requests for every agent (not only Claude Code), and `send_prompt(…, wait_seconds=…)` can wait for
+  the answer.
 
 ## How it works
 
@@ -80,6 +84,7 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - HTTPS in front of stairway (a reverse proxy or a tunnel), because claude.ai connectors require it
 - Optional: [code-server](https://github.com/coder/code-server) 4.x for the browser VS Code
 - Optional: a Telegram bot token from [@BotFather](https://t.me/BotFather)
+- Optional: [herdr](https://herdr.dev) 0.9 or later, for `STAIRWAY_RUNTIME=herdr`
 - Optional: [opencode](https://opencode.ai), [crush](https://github.com/charmbracelet/crush) and/or
   [openclaude](https://github.com/Twigpine/openclaude) (`npm install -g @twigpine/openclaude`, Node 22+), plus an
   API key for an OpenAI-compatible provider (OpenRouter by default)
@@ -114,7 +119,7 @@ Put it behind HTTPS (see [docs/deployment.md](docs/deployment.md)). Then:
 |---|---|
 | `create_experiment(name, prompt?, agent?, model?, mode?, permission_mode?, spawn?, git_init?, start?)` | create `<root>/<name>` and start the agent (Claude Code by default), working on `prompt` right away |
 | `attach_folder(path, name?, prompt?, agent?, model?, mode?, permission_mode?, spawn?)` | ask to use an existing folder. It waits for your approval on `/status` |
-| `send_prompt(name, prompt)` | type a prompt into a running session (it is queued if Claude is busy) |
+| `send_prompt(name, prompt, wait_seconds?)` | type a prompt into a running session (it is queued if Claude is busy). With the herdr runtime, `wait_seconds` waits for the agent to finish |
 | `start_experiment(name, prompt?, agent?, model?, mode?, …)` / `stop_experiment(name)` | start or stop the agent. A restart starts a new conversation |
 | `experiment_status(name)` / `list_experiments()` | state, links, recent prompts, the current terminal |
 | `experiment_info(name)` | the same state as JSON, for programs |
@@ -159,6 +164,8 @@ All settings are environment variables, usually set in `.env`:
 | `STAIRWAY_CLAUDE` | `claude` on PATH | Claude Code binary |
 | `STAIRWAY_CLAUDE_THEME` | `dark-ansi` | theme for sessions. Keep an ANSI theme: screen 4 can't render 24-bit color |
 | `STAIRWAY_CODE_SERVER` | newest `~/.local/lib/code-server-*`, else PATH | code-server binary |
+| `STAIRWAY_RUNTIME` | `screen` | where agents run: `screen` or `herdr`. Experiments started under either keep working after you switch |
+| `STAIRWAY_HERDR` / `STAIRWAY_HERDR_SESSION` | on PATH (or `~/.local/bin/herdr`) / `stairway` | herdr binary, and the named herdr session stairway uses |
 | `STAIRWAY_PROVIDER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible API used by opencode, crush and openclaude |
 | `STAIRWAY_PROVIDER_API_KEY` | `$OPENROUTER_API_KEY` | its API key; it is passed only to those agents' processes |
 | `STAIRWAY_PROVIDER_MODEL` | `deepseek/deepseek-v4.1-flash` | default model for those agents |
