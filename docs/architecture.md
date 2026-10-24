@@ -42,6 +42,7 @@ Experiments themselves are plain folders, `git init`ed by default. stairway neve
 | `/login`, `/logout` | the token | browser login (an HttpOnly, SameSite=Strict cookie) |
 | `/status` | browser login | monitoring page and actions |
 | `/code/<name>/…` | browser login | byte-level proxy to that experiment's code-server unix socket, websockets included |
+| `/herdr/`, `/herdr/ws` | browser login; the websocket also requires a same-origin `Origin` | herdr's UI in the browser: an xterm.js page, and a websocket running `herdr --session <session>` in a pseudo-terminal |
 | `POST /hooks/<name>/{stop,notify,file}?k=<key>` | per-experiment HMAC key | called by the session's Claude Code hooks |
 
 ### OAuth without storage
@@ -141,6 +142,10 @@ through its CLI, so stairway itself stays dependency-free.
 - **Claude Code's renderer:** Claude Code picks its fullscreen renderer for herdr's terminal (libghostty), and
   that renderer hangs in a pane with no client attached. Sessions under herdr therefore get `"tui": "default"`
   in `--settings`.
+- **On the web and phones:** `/herdr/` shows herdr's own interface. It is an xterm.js page (loaded from jsDelivr
+  with subresource integrity) whose websocket runs a herdr client in a pseudo-terminal on the server. herdr
+  switches to its single-column layout on narrow screens, and a key bar adds Esc, Tab, a sticky Ctrl, Ctrl-b
+  (herdr's prefix), Ctrl-c and the arrows. Closing the page ends only that client; the agents keep running.
 - **VS Code:** the "auto" terminal runs `herdr agent attach <pane>` (Ctrl-b q detaches) if no other terminal is
   attached; otherwise it opens a shell.
 - herdr fetches updated agent-detection rules from herdr.dev. Set `[update] manifest_check = false` in

@@ -49,7 +49,8 @@ More about why it exists: [ingmmo.com/stairway](https://ingmmo.com/stairway/) ·
 - **Optional herdr runtime.** With `STAIRWAY_RUNTIME=herdr`, agents run in [herdr](https://herdr.dev) instead of
   screen. herdr knows when each agent is working, done or blocked on a permission question, so stairway reports
   permission requests for every agent (not only Claude Code), and `send_prompt(…, wait_seconds=…)` can wait for
-  the answer.
+  the answer. herdr's own interface is also on the web at `/herdr/`, behind the stairway login: a browser
+  terminal that works on a phone, with a key bar for Esc, Tab, Ctrl and the arrows.
 
 ## How it works
 

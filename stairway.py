@@ -1333,9 +1333,9 @@ def status_page(flash="", base=""):
     stats = "".join('<span title="%s"><b>%s</b> %s</span>' % (e(k), e(short.get(k, k)), e(v)) for k, v in _system_stats())
     out = ['<header class="topbar"><div class="brand"><h1>stairway</h1><span class="muted">%s</span></div>'
            '<nav><a href="#experiments">Experiments</a><a href="#telegram">Telegram</a><a href="#connect">Connect</a>'
-           '<a href="/status">Refresh</a><a href="/logout">Log out</a></nav></header>'
+           '%s<a href="/status">Refresh</a><a href="/logout">Log out</a></nav></header>'
            '<div class="sysbar" title="load (1/5/15 min) · memory · free disk in the experiments root · uptime">%s'
-           '</div>' % (e(socket.gethostname()), stats)]
+           '</div>' % (e(socket.gethostname()), '<a href="/herdr/">herdr</a>' if HERDR else "", stats)]
     if flash:
         out.append('<div class="flash">%s</div>' % e(flash))
 
@@ -2224,7 +2224,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._login()
         if path == "/logout":
             return self._redirect("/login", [("Set-Cookie", "stairway=; Path=/; Max-Age=0")])
-        if path not in ("/", "/status") and not path.startswith("/code/"):
+        if path not in ("/", "/status", "/herdr", "/herdr/", "/herdr/ws") and not path.startswith("/code/"):
             return self._send(404, {"error": "not found"})
         if not self._browser_authorized():
             if self.command == "GET":
@@ -2234,7 +2234,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect("/status")
         if path == "/status":
             return self._status(url.query)
+        if path in ("/herdr", "/herdr/"):
+            if not HERDR:
+                return self._send(404, {"error": "herdr is not installed"})
+            return self._redirect("/herdr/") if path == "/herdr" else self._html(200, HERDR_PAGE)
+        if path == "/herdr/ws":
+            return self._herdr_ws(url.query)
         return self._code(path, url.query)
+
+    def _herdr_ws(self, query):
+        """A websocket running `herdr --session <stairway's session>` in a pseudo-terminal, for /herdr/."""
+        origin = urlsplit(self.headers.get("Origin", "")).netloc
+        if not HERDR or self.headers.get("Upgrade", "").lower() != "websocket" or origin != self.headers.get("Host"):
+            return self._send(400, {"error": "a same-origin websocket is required"})
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+        try:
+            _herdr_server()
+        except ValueError as e:
+            return self._send(500, {"error": str(e)})
+        self.wfile.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                         b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+        self.wfile.flush()
+        self.close_connection = True
+        q = parse_qs(query)
+        _herdr_terminal(self.connection, int(q.get("cols", ["80"])[0]), int(q.get("rows", ["24"])[0]))
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _route
 
@@ -2403,6 +2427,155 @@ class Handler(BaseHTTPRequestHandler):
         if not self.path.startswith("/code/"):
             sys.stderr.write("%s %s\n" % (self.headers.get("X-Real-IP") or self.address_string() if self.headers else
                                            self.address_string(), re.sub(r"k=[0-9a-f]+", "k=<key>", re.sub(r"/mcp/[^ ]+", "/mcp/<token>", fmt % args))))
+
+
+# ---------------------------------------------------------------- /herdr/: herdr's own UI in the browser
+
+def _ws_frame(opcode, payload):
+    n = len(payload)
+    head = bytes([0x80 | opcode]) + (bytes([n]) if n < 126 else
+                                       bytes([126]) + n.to_bytes(2, "big") if n < 65536 else
+                                       bytes([127]) + n.to_bytes(8, "big"))
+    return head + payload
+
+
+def _ws_frames(buf):
+    """Complete client frames in buf as (opcode, payload), and the unparsed rest."""
+    out = []
+    while len(buf) >= 2:
+        opcode, n, at = buf[0] & 0x0F, buf[1] & 0x7F, 2
+        if n == 126:
+            if len(buf) < 4:
+                break
+            n, at = int.from_bytes(buf[2:4], "big"), 4
+        elif n == 127:
+            if len(buf) < 10:
+                break
+            n, at = int.from_bytes(buf[2:10], "big"), 10
+        masked = buf[1] & 0x80
+        if len(buf) < at + (4 if masked else 0) + n:
+            break
+        mask = buf[at:at + 4] if masked else b"\0\0\0\0"
+        at += 4 if masked else 0
+        out.append((opcode, bytes(b ^ mask[i % 4] for i, b in enumerate(buf[at:at + n]))))
+        buf = buf[at + n:]
+    return out, buf
+
+
+def _herdr_terminal(conn, cols, rows):
+    """Bridge a websocket to a herdr client in a pseudo-terminal. Client messages are JSON:
+    {"i": "<input>"} or {"r": [cols, rows]}; server messages are binary terminal output."""
+    import fcntl, pty, signal, struct, termios
+
+    def winsize(fd, c, r):
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", max(2, min(r, 500)), max(10, min(c, 500)), 0, 0))
+    pid, master = pty.fork()
+    if pid == 0:
+        try:
+            os.chdir(STATE)
+            env = dict(_child_env(), TERM="xterm-256color", COLORTERM="truecolor")
+            os.execvpe(HERDR, [HERDR, "--session", HERDR_SESSION], env)
+        finally:
+            os._exit(127)
+    winsize(master, cols, rows)
+    buf = b""
+    try:
+        while True:
+            ready, _, _ = select.select([conn, master], [], [], 60)
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    break
+                conn.sendall(_ws_frame(2, data))
+            if conn in ready:
+                data = conn.recv(65536)
+                if not data:
+                    break
+                frames, buf = _ws_frames(buf + data)
+                for opcode, payload in frames:
+                    if opcode == 8:
+                        raise EOFError
+                    if opcode == 9:
+                        conn.sendall(_ws_frame(10, payload))
+                    elif opcode == 1:
+                        msg = json.loads(payload.decode("utf-8", "replace"))
+                        if "i" in msg:
+                            _write_all(master, msg["i"].encode("utf-8"))
+                        elif "r" in msg:
+                            winsize(master, int(msg["r"][0]), int(msg["r"][1]))
+                            os.kill(pid, signal.SIGWINCH)
+    except (EOFError, OSError, ValueError):
+        pass
+    finally:
+        try:
+            conn.sendall(_ws_frame(8, b""))
+        except OSError:
+            pass
+        os.close(master)
+        try:
+            os.kill(pid, signal.SIGHUP)  # the client only: herdr's server and the agents keep running
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
+
+
+HERDR_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<title>herdr · stairway</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css"
+ integrity="sha384-tStR1zLfWgsiXCF3IgfB3lBa8KmBe/lG287CL9WCeKgQYcp1bjb4/+mwN6oti4Co" crossorigin="anonymous">
+<style>
+html,body{margin:0;height:100%;background:#151514;color:#e6e6e0;font:14px system-ui,sans-serif}
+body{display:flex;flex-direction:column;height:100dvh;padding:env(safe-area-inset-top) env(safe-area-inset-right)
+ env(safe-area-inset-bottom) env(safe-area-inset-left);box-sizing:border-box}
+#term{flex:1;min-height:0;padding:4px}
+#keys{display:flex;gap:6px;padding:6px;overflow-x:auto;border-top:1px solid #33332f;flex:none}
+#keys button,#keys a{flex:none;background:#2a2a27;color:#e6e6e0;border:1px solid #3a3a36;border-radius:7px;
+ padding:7px 11px;font:13px ui-monospace,monospace;text-decoration:none}
+#keys .on{background:#82b3e3;color:#151514}#state{flex:none;font-size:12px;color:#9a9a92;align-self:center;padding:0 6px}
+</style></head><body><div id="term"></div><div id="keys">
+<a href="/status">&larr;</a><button data-k="\\u001b">Esc</button><button data-k="\\t">Tab</button>
+<button id="ctrl">Ctrl</button><button data-k="\\u0002">Ctrl-b</button><button data-k="\\u0003">Ctrl-c</button>
+<button data-k="\\u001b[A">&uarr;</button><button data-k="\\u001b[B">&darr;</button>
+<button data-k="\\u001b[D">&larr;</button><button data-k="\\u001b[C">&rarr;</button>
+<button data-k="\\r">Enter</button><span id="state">connecting…</span></div>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"
+ integrity="sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"
+ integrity="sha384-XGqKrV8Jrukp1NITJbOEHwg01tNkuXr6uB6YEj69ebpYU3v7FvoGgEg23C1Gcehk" crossorigin="anonymous"></script>
+<script>
+const term = new Terminal({cursorBlink: true, fontSize: innerWidth < 600 ? 12 : 14, scrollback: 0,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', theme: {background: '#151514'}});
+const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(document.getElementById('term')); fit.fit();
+const state = document.getElementById('state'), ctrl = document.getElementById('ctrl');
+let ws, ctrlOn = false;
+function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
+function input(d) {
+  if (ctrlOn && d.length === 1) { const c = d.toUpperCase().charCodeAt(0); if (c >= 64 && c < 96) d = String.fromCharCode(c - 64);
+    ctrlOn = false; ctrl.classList.remove('on'); }
+  send({i: d});
+}
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/herdr/ws?cols=' +
+                     term.cols + '&rows=' + term.rows);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { state.textContent = ''; term.focus(); };
+  ws.onmessage = e => term.write(new Uint8Array(e.data));
+  ws.onclose = () => { state.innerHTML = 'disconnected · <a href="" style="color:#82b3e3">reconnect</a>'; };
+}
+term.onData(input);
+term.onBinary(d => send({i: d}));
+term.onResize(({cols, rows}) => send({r: [cols, rows]}));
+new ResizeObserver(() => fit.fit()).observe(document.getElementById('term'));
+document.querySelectorAll('#keys button[data-k]').forEach(b => b.addEventListener('click', e => {
+  e.preventDefault(); input(JSON.parse('"' + b.dataset.k + '"')); term.focus(); }));
+ctrl.addEventListener('click', e => { e.preventDefault(); ctrlOn = !ctrlOn; ctrl.classList.toggle('on', ctrlOn); term.focus(); });
+connect();
+</script></body></html>
+"""
 
 
 # ---------------------------------------------------------------- tty256: 24-bit color -> 256 colors

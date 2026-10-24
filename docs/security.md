@@ -9,7 +9,7 @@ read, write and execute things, with the permissions of the user stairway runs a
 |---|---|---|
 | MCP via OAuth (claude.ai, Claude Code) | you allowed the client on `/authorize`, which needs the token or a logged-in browser | everything the MCP tools offer |
 | MCP via `/mcp/<token>` or `Bearer <token>` | the token | the same |
-| Web pages (`/status`, `/code/…`) | a login cookie, obtained with the token | everything, plus a full VS Code with shells |
+| Web pages (`/status`, `/code/…`, `/herdr/`) | a login cookie, obtained with the token | everything, plus a full VS Code with shells and herdr's UI (which can open shells too) |
 | Telegram | membership in a chat you approved on `/status` | prompts, `/approve`, `/deny`, starting and stopping the bound experiment, reading and writing files inside it |
 | Hooks (`/hooks/<name>/…`) | a per-experiment HMAC key, known to that experiment's Claude | post to that experiment's bound chats; send files from inside that experiment |
 
