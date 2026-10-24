@@ -36,7 +36,8 @@ More about why it exists: [ingmmo.com/stairway](https://ingmmo.com/stairway/) ·
 - **Status page.** It shows system load, memory and disk, every experiment and its terminal, pending approvals,
   forms to create or attach experiments, a prompt box, and copy-paste connection settings.
 - **VS Code in the browser, on demand.** stairway proxies code-server per experiment, websockets included.
-  The first terminal joins the Claude session; every other terminal is a shell in the folder.
+  The first terminal joins the Claude session; every other terminal is a shell in the folder. With herdr
+  installed, a "herdr" terminal profile opens herdr's interface for all experiments.
   You can upload files by dragging them in.
 - **Telegram mode.** Add the bot to a group and approve the group. Then talk to the experiment's Claude by
   mentioning the bot. Its replies, permission requests and files come back to the group.

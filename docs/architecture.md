@@ -155,5 +155,7 @@ through its CLI, so stairway itself stays dependency-free.
 
 `state/code/<name>/terminal.sh` is the default terminal profile ("auto"). In session mode, if no one is
 attached to the Claude screen, it attaches with `screen -x`. Otherwise it starts a login shell in the folder.
-The "claude session" profile always attaches, and the "shell" profile never does. stairway rewrites the
-profiles each time the editor starts, and keeps any other settings.
+The "claude session" profile always attaches, and the "shell" profile never does. When herdr is installed, a
+"herdr" profile opens herdr's own interface (`herdr --session <session>`), with every experiment's agents and
+panes. stairway rewrites the profiles each time an editor starts and when stairway itself starts, keeping any
+other settings. VS Code reloads `settings.json` live, so open editors get new profiles without a restart.

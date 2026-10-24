@@ -923,6 +923,9 @@ def _write_editor_settings(name, data):
         "auto": {"path": script, "args": ["auto"], "overrideName": True},
         "claude session": {"path": script, "args": ["claude"], "icon": "sparkle", "overrideName": True},
         "shell": {"path": "bash", "args": ["-l"]}}
+    if HERDR:  # herdr's own UI: every experiment's agents, their states, and their panes
+        settings["terminal.integrated.profiles.linux"]["herdr"] = {
+            "path": HERDR, "args": ["--session", HERDR_SESSION], "icon": "server-process", "overrideName": True}
     settings["terminal.integrated.defaultProfile.linux"] = "auto"
     with open(path, "w") as f:
         json.dump(settings, f, indent=2)
@@ -2531,17 +2534,25 @@ HERDR_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 html,body{margin:0;height:100%;background:#151514;color:#e6e6e0;font:14px system-ui,sans-serif}
 body{display:flex;flex-direction:column;height:100dvh;padding:env(safe-area-inset-top) env(safe-area-inset-right)
  env(safe-area-inset-bottom) env(safe-area-inset-left);box-sizing:border-box}
+#top{display:flex;align-items:center;gap:10px;padding:6px 10px;border-bottom:1px solid #33332f;flex:none;
+ font-size:13px}
+#top a{color:#82b3e3;text-decoration:none;white-space:nowrap}#top b{font-weight:600}
+#top .grow{flex:1}#state{color:#9a9a92;font-size:12px;white-space:nowrap}
+#top button{background:#2a2a27;color:#e6e6e0;border:1px solid #3a3a36;border-radius:7px;padding:4px 10px;font:12px system-ui}
 #term{flex:1;min-height:0;padding:4px}
 #keys{display:flex;gap:6px;padding:6px;overflow-x:auto;border-top:1px solid #33332f;flex:none}
 #keys button,#keys a{flex:none;background:#2a2a27;color:#e6e6e0;border:1px solid #3a3a36;border-radius:7px;
  padding:7px 11px;font:13px ui-monospace,monospace;text-decoration:none}
-#keys .on{background:#82b3e3;color:#151514}#state{flex:none;font-size:12px;color:#9a9a92;align-self:center;padding:0 6px}
-</style></head><body><div id="term"></div><div id="keys">
-<a href="/status">&larr;</a><button data-k="\\u001b">Esc</button><button data-k="\\t">Tab</button>
+#keys .on{background:#82b3e3;color:#151514}
+</style></head><body>
+<div id="top"><a href="/status">&larr; stairway</a><b>herdr</b><span class="grow"></span>
+<span id="state">connecting…</span><button id="again" hidden>Reconnect</button></div>
+<div id="term"></div><div id="keys">
+<button data-k="\\u001b">Esc</button><button data-k="\\t">Tab</button>
 <button id="ctrl">Ctrl</button><button data-k="\\u0002">Ctrl-b</button><button data-k="\\u0003">Ctrl-c</button>
 <button data-k="\\u001b[A">&uarr;</button><button data-k="\\u001b[B">&darr;</button>
 <button data-k="\\u001b[D">&larr;</button><button data-k="\\u001b[C">&rarr;</button>
-<button data-k="\\r">Enter</button><span id="state">connecting…</span></div>
+<button data-k="\\r">Enter</button></div>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"
  integrity="sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"
@@ -2550,7 +2561,8 @@ body{display:flex;flex-direction:column;height:100dvh;padding:env(safe-area-inse
 const term = new Terminal({cursorBlink: true, fontSize: innerWidth < 600 ? 12 : 14, scrollback: 0,
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', theme: {background: '#151514'}});
 const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(document.getElementById('term')); fit.fit();
-const state = document.getElementById('state'), ctrl = document.getElementById('ctrl');
+const state = document.getElementById('state'), ctrl = document.getElementById('ctrl'),
+      again = document.getElementById('again');
 let ws, ctrlOn = false;
 function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
 function input(d) {
@@ -2562,9 +2574,10 @@ function connect() {
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/herdr/ws?cols=' +
                      term.cols + '&rows=' + term.rows);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { state.textContent = ''; term.focus(); };
+  state.textContent = 'connecting…'; again.hidden = true;
+  ws.onopen = () => { state.textContent = 'connected'; term.focus(); };
   ws.onmessage = e => term.write(new Uint8Array(e.data));
-  ws.onclose = () => { state.innerHTML = 'disconnected · <a href="" style="color:#82b3e3">reconnect</a>'; };
+  ws.onclose = () => { state.textContent = 'disconnected'; again.hidden = false; };
 }
 term.onData(input);
 term.onBinary(d => send({i: d}));
@@ -2573,6 +2586,7 @@ new ResizeObserver(() => fit.fit()).observe(document.getElementById('term'));
 document.querySelectorAll('#keys button[data-k]').forEach(b => b.addEventListener('click', e => {
   e.preventDefault(); input(JSON.parse('"' + b.dataset.k + '"')); term.focus(); }));
 ctrl.addEventListener('click', e => { e.preventDefault(); ctrlOn = !ctrlOn; ctrl.classList.toggle('on', ctrlOn); term.focus(); });
+again.addEventListener('click', () => { term.reset(); connect(); });
 connect();
 </script></body></html>
 """
@@ -2681,6 +2695,10 @@ def main():
     print("stairway: http://%s:%d  (MCP at /mcp/<token>, status at /status), experiments root %s, runtime %s, "
           "code-server: %s" % (HOST, PORT, ROOT, RUNTIME if RUNTIME == "screen" else "herdr (%s, session %s)"
                                % (HERDR, HERDR_SESSION), CODE_SERVER), file=sys.stderr)
+    for name in _load():  # editors pick up new terminal profiles live (VS Code watches settings.json)
+        data = os.path.join(_editor_dir(name), "data")
+        if os.path.isdir(data):
+            _write_editor_settings(name, data)
     if TG_TOKEN:
         threading.Thread(target=_tg_loop, daemon=True).start()
     # Finished replies go to bound Telegram chats and to experiments' callbacks.
